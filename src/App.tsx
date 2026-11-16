@@ -100,6 +100,7 @@ function App() {
   const [exportError, setExportError] = useState<string | null>(null)
   const [exporting, setExporting] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [modifying, setModifying] = useState(false)
 
   const activePreset = PRESETS.find((item) => item.id === preset) ?? PRESETS[1]
   const aspectW = preset === 'custom' ? customW : activePreset.w
@@ -147,6 +148,17 @@ function App() {
     })
     setBreakIndex(0)
     setSelectedId(null)
+    setModifying(false)
+  }
+
+  function deletePhoto(id: string) {
+    const index = photos.findIndex((photo) => photo.id === id)
+    if (index < 0) return
+    const next = photos.slice()
+    const [removed] = next.splice(index, 1)
+    URL.revokeObjectURL(removed.objectUrl)
+    if (selectedId === id) setSelectedId(null)
+    commit(next, index < breakIndex ? breakIndex - 1 : breakIndex)
   }
 
   function movePhoto(from: number, targetIndex: number, place: 'before' | 'after') {
@@ -219,6 +231,8 @@ function App() {
             event.target.value = ''
           }}
         />
+
+        <span className="toolbar-split" aria-hidden />
 
         <label>
           Aspect
@@ -312,11 +326,42 @@ function App() {
         </span>
         {exportError ? <span className="export-error">{exportError}</span> : null}
 
-        <button type="button" onClick={clearAll}>
-          Clear
-        </button>
-
-        <span className="counts">{countLabel}</span>
+        <span className="toolbar-end">
+          <span className="counts">{countLabel}</span>
+          <span className="toolbar-split" aria-hidden />
+          <button
+            type="button"
+            className={`icon-btn${modifying ? ' on' : ''}`}
+            aria-label="Delete photos"
+            aria-pressed={modifying}
+            title="Click a photo in the sequence to delete it"
+            onClick={() => {
+              setModifying((on) => !on)
+              setSelectedId(null)
+            }}
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden>
+              <path
+                fill="currentColor"
+                d="M11.8 1.2a1.4 1.4 0 0 1 2 2L5.4 11.6 2 12.8l1.2-3.4 8.6-8.2zM3.1 13.5h10.4v1.3H3.1z"
+              />
+            </svg>
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            aria-label="Clear"
+            title="Clear all photos"
+            onClick={clearAll}
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden>
+              <path
+                fill="currentColor"
+                d="M3.2 3.2 4.3 2.1 8 5.8l3.7-3.7 1.1 1.1L9.1 6.9l3.7 3.7-1.1 1.1L8 8l-3.7 3.7-1.1-1.1L6.9 6.9 3.2 3.2z"
+              />
+            </svg>
+          </button>
+        </span>
       </header>
 
       <div className="workspace">
@@ -332,6 +377,8 @@ function App() {
           includeAll={includeAll}
           onIncludeAll={setIncludeAll}
           packedIds={packedIds}
+          modifying={modifying}
+          onDelete={deletePhoto}
         />
         <div className={selected ? 'stage editing' : 'stage preview'}>
           {selected ? (

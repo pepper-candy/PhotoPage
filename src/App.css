@@ -41,6 +41,19 @@
   width: 64px;
 }
 
+.toolbar button.on {
+  border-color: #e07070;
+  background: #2a1c1c;
+  color: #e07070;
+}
+
+.toolbar .icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 7px;
+}
+
 .toolbar button,
 .crop-bar button {
   font: inherit;
@@ -74,8 +87,14 @@
   font-size: 12px;
 }
 
-.counts {
+.toolbar-end {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
   margin-left: auto;
+}
+
+.counts {
   color: var(--muted);
 }
 
@@ -137,6 +156,15 @@
 
 .inc-all input {
   margin: 0;
+}
+
+.sequence.modifying .seq-item {
+  cursor: pointer;
+}
+
+.sequence.modifying .seq-item:hover {
+  border-color: #e07070;
+  background: #2a1c1c;
 }
 
 .seq-item {

@@ -13,6 +13,8 @@ type Props = {
   includeAll: boolean
   onIncludeAll: (value: boolean) => void
   packedIds: Set<string>
+  modifying: boolean
+  onDelete: (id: string) => void
 }
 
 type InsertPreview = {
@@ -36,6 +38,8 @@ export default function PhotoTray({
   includeAll,
   onIncludeAll,
   packedIds,
+  modifying,
+  onDelete,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null)
   const dragIndex = useRef<number | null>(null)
@@ -133,11 +137,15 @@ export default function PhotoTray({
         key={photo.id}
         data-photo-index={index}
         className={`seq-item${selectedId === photo.id ? ' selected' : ''}${over ? ' over' : ''}${packedIds.has(photo.id) ? '' : ' unused'}`}
-        draggable
+        draggable={!modifying}
         onPointerDown={() => {
           skipClick.current = false
         }}
         onDragStart={(event) => {
+          if (modifying) {
+            event.preventDefault()
+            return
+          }
           skipClick.current = true
           dragIndex.current = index
           event.dataTransfer.setData('text/plain', String(index))
@@ -169,9 +177,13 @@ export default function PhotoTray({
             skipClick.current = false
             return
           }
+          if (modifying) {
+            onDelete(photo.id)
+            return
+          }
           onSelect(selectedId === photo.id ? null : photo.id)
         }}
-        title={photo.name}
+        title={modifying ? `Delete ${photo.name}` : photo.name}
       >
         <img src={photo.objectUrl} alt="" draggable={false} />
         <span className="seq-name">{photo.name}</span>
@@ -181,7 +193,7 @@ export default function PhotoTray({
 
   return (
     <div
-      className={`sequence${placing ? ' placing-break' : ''}`}
+      className={`sequence${placing ? ' placing-break' : ''}${modifying ? ' modifying' : ''}`}
       ref={listRef}
       aria-label="Photo sequence"
     >
