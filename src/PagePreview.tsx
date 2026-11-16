@@ -1,7 +1,19 @@
-import { useEffect, useMemo, useRef, type CSSProperties, type PointerEvent, type ReactElement } from 'react'
-import { canPan, panSource, zoomSource } from './crop.ts'
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent,
+  type ReactElement,
+} from 'react'
+import { adaptSource, canPan, panSource, zoomSource } from './crop.ts'
+import { fillSpareHole, spareHoles } from './packer.ts'
 import { findCuts, nudgeCut, type Cut } from './seams.ts'
 import type { Page, Photo, Placement, Rect } from './types.ts'
+
+const SWAP_SLOP = 10
 
 type Props = {
   page: Page
@@ -12,6 +24,8 @@ type Props = {
   onPlacements?: (next: Placement[]) => void
   gutter?: number
   packing?: boolean
+  onBusy?: (work: () => void) => void
+  spares?: Photo[]
   modifying?: boolean
   starring?: boolean
   onDelete?: (id: string) => void
@@ -26,6 +40,42 @@ function withSource(placement: Placement, src: Rect): Placement {
   return { ...placement, sx: src.x, sy: src.y, sw: src.w, sh: src.h }
 }
 
+function cellIdAt(clientX: number, clientY: number, ignoreId?: string): string | null {
+  const stack = document.elementsFromPoint(clientX, clientY)
+  for (const node of stack) {
+    const host = node instanceof Element ? node.closest('.placed') : null
+    if (!(host instanceof HTMLElement)) continue
+    const id = host.dataset.photoId
+    if (id && id !== ignoreId) return id
+  }
+  return null
+}
+
+function swapCells(
+  placements: Placement[],
+  photos: Map<string, Photo>,
+  fromId: string,
+  toId: string,
+): Placement[] | null {
+  if (fromId === toId) return null
+  const a = placements.find((item) => item.photoId === fromId)
+  const b = placements.find((item) => item.photoId === toId)
+  const photoA = photos.get(fromId)
+  const photoB = photos.get(toId)
+  if (!a || !b || !photoA || !photoB) return null
+  const srcA = adaptSource(photoA, b.w / Math.max(b.h, 0.001), srcOf(a))
+  const srcB = adaptSource(photoB, a.w / Math.max(a.h, 0.001), srcOf(b))
+  return placements.map((item) => {
+    if (item.photoId === fromId) {
+      return { x: a.x, y: a.y, w: a.w, h: a.h, photoId: toId, sx: srcB.x, sy: srcB.y, sw: srcB.w, sh: srcB.h }
+    }
+    if (item.photoId === toId) {
+      return { x: b.x, y: b.y, w: b.w, h: b.h, photoId: fromId, sx: srcA.x, sy: srcA.y, sw: srcA.w, sh: srcA.h }
+    }
+    return item
+  })
+}
+
 function CroppedPhoto({
   photo,
   placement,
@@ -33,8 +83,12 @@ function CroppedPhoto({
   selected,
   action,
   interactive,
+  swapFrom,
+  swapOver,
   onActivate,
   onSource,
+  onSwapTravel,
+  onSwapEnd,
 }: {
   photo: Photo
   placement: Placement
@@ -42,8 +96,12 @@ function CroppedPhoto({
   selected: boolean
   action: 'delete' | 'star' | null
   interactive: boolean
+  swapFrom: string | null
+  swapOver: string | null
   onActivate: () => void
   onSource: (src: Rect) => void
+  onSwapTravel: (fromId: string, overId: string | null, x: number, y: number, w: number, h: number) => void
+  onSwapEnd: (fromId: string, toId: string | null) => void
 }): ReactElement {
   const { x, y, w, h, sx, sy, sw, sh } = placement
   const scale = Math.min(w / Math.max(sw, 0.001), h / Math.max(sh, 0.001))
@@ -72,8 +130,17 @@ function CroppedPhoto({
           src: Rect
         }
       | null
+    swap:
+      | {
+          pointer: number
+          startX: number
+          startY: number
+          width: number
+          height: number
+        }
+      | null
     moved: boolean
-  }>({ pointers: new Map(), pinch: null, pan: null, moved: false })
+  }>({ pointers: new Map(), pinch: null, pan: null, swap: null, moved: false })
 
   const pannable = interactive && canPan(photo, srcOf(placement))
 
@@ -152,7 +219,19 @@ function CroppedPhoto({
     if (!interactive) return
     const live = gesture.current
     live.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    if (live.pointers.size === 1) {
+      const rect = cellRef.current?.getBoundingClientRect()
+      live.swap = {
+        pointer: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        width: rect?.width ?? placement.w,
+        height: rect?.height ?? placement.h,
+      }
+    }
     if (live.pointers.size === 2) {
+      live.swap = null
+      onSwapEnd(photo.id, null)
       const pts = [...live.pointers.values()]
       const dx = pts[1].x - pts[0].x
       const dy = pts[1].y - pts[0].y
@@ -172,6 +251,25 @@ function CroppedPhoto({
     const live = gesture.current
     if (!live.pointers.has(event.pointerId)) return
     live.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    if (live.swap && live.swap.pointer === event.pointerId && live.pointers.size < 2 && !live.pinch) {
+      const dx = event.clientX - live.swap.startX
+      const dy = event.clientY - live.swap.startY
+      if (!live.moved && dx * dx + dy * dy < SWAP_SLOP * SWAP_SLOP) return
+      if (!live.moved) {
+        live.moved = true
+        cellRef.current?.setPointerCapture(event.pointerId)
+      }
+      onSwapTravel(
+        photo.id,
+        cellIdAt(event.clientX, event.clientY, photo.id),
+        event.clientX,
+        event.clientY,
+        live.swap.width,
+        live.swap.height,
+      )
+      event.preventDefault()
+      return
+    }
     if (!live.pinch || live.pointers.size < 2) return
     const pts = [...live.pointers.values()]
     const dx = pts[1].x - pts[0].x
@@ -189,6 +287,14 @@ function CroppedPhoto({
   function onCellUp(event: PointerEvent<HTMLButtonElement>) {
     const live = gesture.current
     live.pointers.delete(event.pointerId)
+    if (live.swap && live.swap.pointer === event.pointerId) {
+      const toId = live.moved ? cellIdAt(event.clientX, event.clientY, photo.id) : null
+      live.swap = null
+      if (cellRef.current?.hasPointerCapture(event.pointerId)) {
+        cellRef.current.releasePointerCapture(event.pointerId)
+      }
+      onSwapEnd(photo.id, toId)
+    }
     if (live.pointers.size < 2) live.pinch = null
   }
 
@@ -196,7 +302,8 @@ function CroppedPhoto({
     <button
       ref={cellRef}
       type="button"
-      className={`placed${selected ? ' selected' : ''}${action ? ` ${action}` : ''}`}
+      className={`placed${selected ? ' selected' : ''}${action ? ` ${action}` : ''}${swapFrom === photo.id ? ' swap-source' : ''}${swapOver === photo.id ? ' swap-target' : ''}`}
+      data-photo-id={photo.id}
       style={{
         left: `${(x / page.width) * 100}%`,
         top: `${(y / page.height) * 100}%`,
@@ -285,6 +392,8 @@ export default function PagePreview({
   onPlacements,
   gutter = 0,
   packing = false,
+  onBusy,
+  spares = [],
   modifying = false,
   starring = false,
   onDelete,
@@ -302,17 +411,62 @@ export default function PagePreview({
   } | null>(null)
   const placementsRef = useRef(placements)
   placementsRef.current = placements
+  const ghostRef = useRef<HTMLDivElement>(null)
+  const ghostPos = useRef({ x: 0, y: 0, w: 0, h: 0 })
+  const [swapFrom, setSwapFrom] = useState<string | null>(null)
+  const [swapOver, setSwapOver] = useState<string | null>(null)
+
+  function placeGhost(clientX: number, clientY: number, w: number, h: number) {
+    const rect = pageRef.current?.getBoundingClientRect()
+    const x = clientX - (rect?.left ?? 0) - w / 2
+    const y = clientY - (rect?.top ?? 0) - h / 2
+    ghostPos.current = { x, y, w, h }
+    const ghost = ghostRef.current
+    if (!ghost) return
+    ghost.style.width = `${w}px`
+    ghost.style.height = `${h}px`
+    ghost.style.transform = `translate(${x}px, ${y}px)`
+  }
+
+  useLayoutEffect(() => {
+    if (!swapFrom) return
+    const { x, y, w, h } = ghostPos.current
+    const ghost = ghostRef.current
+    if (!ghost || w <= 0) return
+    ghost.style.width = `${w}px`
+    ghost.style.height = `${h}px`
+    ghost.style.transform = `translate(${x}px, ${y}px)`
+  }, [swapFrom])
 
   const cuts = useMemo(
     () => (action || packing ? [] : findCuts(placements, gutter)),
     [action, packing, placements, gutter],
   )
 
+  const gaps = useMemo(() => {
+    if (action || packing || swapFrom || spares.length === 0) return []
+    return spareHoles(page, placements, gutter)
+  }, [action, packing, swapFrom, spares.length, page, placements, gutter])
+
   function patchSource(photoId: string, src: Rect) {
     if (!onPlacements || packing) return
     onPlacements(
       placementsRef.current.map((item) => (item.photoId === photoId ? withSource(item, src) : item)),
     )
+  }
+
+  function onSwapTravel(fromId: string, overId: string | null, x: number, y: number, w: number, h: number) {
+    setSwapFrom(fromId)
+    setSwapOver(overId)
+    placeGhost(x, y, w, h)
+  }
+
+  function onSwapEnd(fromId: string, toId: string | null) {
+    setSwapFrom(null)
+    setSwapOver(null)
+    if (!onPlacements || packing || !toId || toId === fromId) return
+    const next = swapCells(placementsRef.current, byId, fromId, toId)
+    if (next) onPlacements(next)
   }
 
   function onCutDown(event: PointerEvent<HTMLDivElement>, cut: Cut) {
@@ -365,7 +519,7 @@ export default function PagePreview({
   return (
     <div
       ref={pageRef}
-      className={`page${action ? ` ${action === 'delete' ? 'modifying' : 'starring'}` : ''}`}
+      className={`page${action ? ` ${action === 'delete' ? 'modifying' : 'starring'}` : ''}${swapFrom ? ' swapping' : ''}`}
       style={
         {
           '--pw': page.width,
@@ -391,12 +545,16 @@ export default function PagePreview({
             selected={!action && selectedId === placement.photoId}
             action={action}
             interactive={!action && !packing && !!onPlacements}
+            swapFrom={swapFrom}
+            swapOver={swapOver}
             onActivate={() => {
               if (modifying) onDelete?.(placement.photoId)
               else if (starring) onStar?.(placement.photoId)
               else onSelect(placement.photoId)
             }}
             onSource={(src) => patchSource(placement.photoId, src)}
+            onSwapTravel={onSwapTravel}
+            onSwapEnd={onSwapEnd}
           />
         )
       })}
@@ -424,6 +582,63 @@ export default function PagePreview({
           onClick={(event) => event.stopPropagation()}
         />
       ))}
+      {gaps.map((hole) => (
+        <button
+          key={`gap:${Math.round(hole.x)}:${Math.round(hole.y)}:${Math.round(hole.w)}:${Math.round(hole.h)}`}
+          type="button"
+          className="gap-fill"
+          aria-label="Fill gap with unused photo"
+          title="Fill gap with unused photo"
+          style={{
+            left: `${(hole.x / page.width) * 100}%`,
+            top: `${(hole.y / page.height) * 100}%`,
+            width: `${(hole.w / page.width) * 100}%`,
+            height: `${(hole.h / page.height) * 100}%`,
+          }}
+          onClick={(event) => {
+            event.stopPropagation()
+            if (!onPlacements || packing) return
+            const work = () => {
+              const next = fillSpareHole(placementsRef.current, photos, page, gutter, hole)
+              if (next.length > placementsRef.current.length) onPlacements(next)
+            }
+            if (onBusy) onBusy(work)
+            else work()
+          }}
+        >
+          <span className="gap-fill-plus" aria-hidden>
+            <svg viewBox="0 0 16 16" width="16" height="16">
+              <path fill="currentColor" d="M7.1 3.2h1.8v3.9h3.9v1.8H8.9v3.9H7.1V8.9H3.2V7.1h3.9V3.2z" />
+            </svg>
+          </span>
+        </button>
+      ))}
+      {swapFrom ? (
+        <div ref={ghostRef} className="swap-ghost" aria-hidden>
+          {(() => {
+            const item = placements.find((placement) => placement.photoId === swapFrom)
+            const photo = item ? byId.get(item.photoId) : undefined
+            if (!item || !photo) return null
+            const scale = Math.min(
+              item.w / Math.max(item.sw, 0.001),
+              item.h / Math.max(item.sh, 0.001),
+            )
+            return (
+              <img
+                src={photo.objectUrl}
+                alt=""
+                draggable={false}
+                style={{
+                  width: `${((photo.width * scale) / item.w) * 100}%`,
+                  height: `${((photo.height * scale) / item.h) * 100}%`,
+                  left: `${((-item.sx * scale) / item.w) * 100}%`,
+                  top: `${((-item.sy * scale) / item.h) * 100}%`,
+                }}
+              />
+            )
+          })()}
+        </div>
+      ) : null}
     </div>
   )
 }

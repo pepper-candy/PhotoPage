@@ -1,4 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+
+function afterPaint(fn: () => void): () => void {
+  let inner = 0
+  const outer = requestAnimationFrame(() => {
+    inner = requestAnimationFrame(fn)
+  })
+  return () => {
+    cancelAnimationFrame(outer)
+    cancelAnimationFrame(inner)
+  }
+}
 import CropEditor from './CropEditor.tsx'
 import PagePreview from './PagePreview.tsx'
 import PhotoTray from './PhotoTray.tsx'
@@ -202,6 +213,12 @@ function App() {
     () => ({ gutter, breakIndex, layout, includeAll }),
     [gutter, breakIndex, layout, includeAll],
   )
+  const packSig = `${photos.map((photo) => `${photo.id}:${photo.group}:${photo.safe.x}:${photo.safe.y}:${photo.safe.w}:${photo.safe.h}`).join(',')}|${page.width}x${page.height}|${gutter}|${layout}|${includeAll}|${breakIndex}`
+  const packSigRef = useRef(packSig)
+  if (packSig !== packSigRef.current) {
+    packSigRef.current = packSig
+    if (photos.length > 0 && !packing) setPacking(true)
+  }
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -224,32 +241,47 @@ function App() {
     }
     setPacking(true)
     const job: PackJob = { id, photos, page, options: packOptions }
-    let worker: Worker
-    try {
-      worker = new PackWorker()
-    } catch {
-      const next = pack(job.photos, job.page, job.options)
-      if (id === packId.current) {
-        setPlacements(next)
+    let worker: Worker | undefined
+    const stop = afterPaint(() => {
+      if (id !== packId.current) return
+      try {
+        worker = new PackWorker()
+      } catch {
+        const next = pack(job.photos, job.page, job.options)
+        if (id === packId.current) {
+          setPlacements(next)
+          setPacking(false)
+        }
+        return
+      }
+      worker.onmessage = (event: MessageEvent<PackResult>) => {
+        if (event.data.id !== packId.current) return
+        setPlacements(event.data.placements)
         setPacking(false)
       }
-      return
-    }
-    worker.onmessage = (event: MessageEvent<PackResult>) => {
-      if (event.data.id !== packId.current) return
-      setPlacements(event.data.placements)
-      setPacking(false)
-    }
-    worker.onerror = () => {
-      if (id !== packId.current) return
-      setPlacements(pack(job.photos, job.page, job.options))
-      setPacking(false)
-    }
-    worker.postMessage(job)
+      worker.onerror = () => {
+        if (id !== packId.current) return
+        setPlacements(pack(job.photos, job.page, job.options))
+        setPacking(false)
+      }
+      worker.postMessage(job)
+    })
     return () => {
-      worker.terminate()
+      stop()
+      worker?.terminate()
     }
   }, [photos, page, packOptions])
+
+  function runBusy(work: () => void) {
+    setPacking(true)
+    afterPaint(() => {
+      try {
+        work()
+      } finally {
+        setPacking(false)
+      }
+    })
+  }
 
   function commit(list: Photo[], breakAt: number) {
     const cut = Math.max(0, Math.min(list.length, breakAt))
@@ -595,6 +627,8 @@ function App() {
               onPlacements={setPlacements}
               gutter={gutter}
               packing={packing}
+              onBusy={runBusy}
+              spares={photos.filter((photo) => !packedIds.has(photo.id))}
               modifying={modifying}
               starring={starring}
               onDelete={deletePhoto}

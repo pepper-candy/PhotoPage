@@ -2309,3 +2309,38 @@ export function pack(photos: Photo[], page: Page, options: PackOptions): Placeme
 
   return finish(placed)
 }
+
+export function spareHoles(page: Page, placements: Placement[], gutter: number): Rect[] {
+  const g = Math.max(0, gutter)
+  const minSide = Math.max(40, g + 16)
+  const full: Rect = { x: 0, y: 0, w: page.width, h: page.height }
+  return leftoverHoles(full, placements, g)
+    .filter((hole) => hole.w >= minSide && hole.h >= minSide)
+    .sort((a, b) => b.w * b.h - a.w * a.h)
+}
+
+export function fillSpareHole(
+  placements: Placement[],
+  photos: Photo[],
+  page: Page,
+  gutter: number,
+  hole: Rect,
+): Placement[] {
+  const g = Math.max(0, gutter)
+  const used = new Set(placements.map((item) => item.photoId))
+  const remaining = photos.filter((photo) => !used.has(photo.id))
+  if (remaining.length === 0) return placements
+  const byId = new Map(photos.map((photo) => [photo.id, photo]))
+  const focusPlaced = placements.filter((item) => byId.get(item.photoId)?.group === 'focus')
+  const cap = nicheAreaCap(focusPlaced)
+  let extra = placeIntoHole(remaining, hole, g, false, cap)
+  if (extra.length === 0) extra = placeIntoHole(remaining.slice(0, 1), hole, g, true, cap)
+  if (extra.length === 0) return placements
+  const full: Rect = { x: 0, y: 0, w: page.width, h: page.height }
+  const combined = [...placements, ...extra]
+  const leftover = remaining.filter((photo) => !extra.some((item) => item.photoId === photo.id))
+  const focusIds = new Set(focusPlaced.map((item) => item.photoId))
+  return finish(
+    gapFill(combined, photos, full, g, cap, GAP_PASSES, canGrowFocus(combined, leftover, focusIds)),
+  )
+}
