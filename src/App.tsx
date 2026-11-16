@@ -38,10 +38,80 @@ const PRESETS = [
 const LAYOUTS: { id: LayoutMode; label: string }[] = [
   { id: 'top', label: 'Top' },
   { id: 'bottom', label: 'Bottom' },
-  { id: 'scattered', label: 'Scattered' },
   { id: 'ring', label: 'Ring' },
   { id: 'center', label: 'Center' },
 ]
+
+const PREFS_KEY = 'photopage.user-prefs'
+const DEFAULT_PRESET = '16:9'
+const DEFAULT_EXPORT: ExportSizeId = 'original'
+
+type UserPrefs = {
+  preset: string
+  customW: number
+  customH: number
+  layout: LayoutMode
+  gutter: number
+  exportSize: ExportSizeId
+}
+
+function isLayoutMode(value: unknown): value is LayoutMode {
+  return LAYOUTS.some((item) => item.id === value)
+}
+
+function isExportSize(value: unknown): value is ExportSizeId {
+  return EXPORT_SIZES.some((item) => item.id === value)
+}
+
+function loadUserPrefs(): UserPrefs | null {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY)
+    if (!raw) return null
+    const data = JSON.parse(raw) as Partial<UserPrefs>
+    const preset =
+      typeof data.preset === 'string' && PRESETS.some((item) => item.id === data.preset)
+        ? data.preset
+        : DEFAULT_PRESET
+    const layout = isLayoutMode(data.layout) ? data.layout : DEFAULT_LAYOUT
+    const gutter =
+      typeof data.gutter === 'number' && Number.isFinite(data.gutter)
+        ? Math.max(0, data.gutter)
+        : DEFAULT_GUTTER
+    const exportSize = isExportSize(data.exportSize) ? data.exportSize : DEFAULT_EXPORT
+    const customW =
+      typeof data.customW === 'number' && Number.isFinite(data.customW) && data.customW > 0
+        ? data.customW
+        : 4
+    const customH =
+      typeof data.customH === 'number' && Number.isFinite(data.customH) && data.customH > 0
+        ? data.customH
+        : 5
+    return { preset, customW, customH, layout, gutter, exportSize }
+  } catch {
+    return null
+  }
+}
+
+function saveUserPrefs(prefs: UserPrefs) {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs))
+  } catch {
+    /* private mode / quota */
+  }
+}
+
+function startingPrefs(): UserPrefs {
+  return (
+    loadUserPrefs() ?? {
+      preset: DEFAULT_PRESET,
+      customW: 4,
+      customH: 5,
+      layout: DEFAULT_LAYOUT,
+      gutter: DEFAULT_GUTTER,
+      exportSize: DEFAULT_EXPORT,
+    }
+  )
+}
 
 function isRaster(file: File): boolean {
   const type = file.type.toLowerCase()
@@ -96,15 +166,16 @@ function stamp(list: Photo[], breakAt: number): Photo[] {
 
 function App() {
   const fileRef = useRef<HTMLInputElement>(null)
+  const [start] = useState(startingPrefs)
   const [photos, setPhotos] = useState<Photo[]>([])
   const [breakIndex, setBreakIndex] = useState(0)
-  const [preset, setPreset] = useState<string>('4:5')
-  const [customW, setCustomW] = useState(4)
-  const [customH, setCustomH] = useState(5)
-  const [gutter, setGutter] = useState(DEFAULT_GUTTER)
-  const [layout, setLayout] = useState<LayoutMode>(DEFAULT_LAYOUT)
-  const [includeAll, setIncludeAll] = useState(true)
-  const [exportSize, setExportSize] = useState<ExportSizeId>('original')
+  const [preset, setPreset] = useState(start.preset)
+  const [customW, setCustomW] = useState(start.customW)
+  const [customH, setCustomH] = useState(start.customH)
+  const [gutter, setGutter] = useState(start.gutter)
+  const [layout, setLayout] = useState<LayoutMode>(start.layout)
+  const [includeAll, setIncludeAll] = useState(false)
+  const [exportSize, setExportSize] = useState<ExportSizeId>(start.exportSize)
   const [exportError, setExportError] = useState<string | null>(null)
   const [exporting, setExporting] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -114,7 +185,7 @@ function App() {
   const [packing, setPacking] = useState(false)
   const packId = useRef(0)
 
-  const activePreset = PRESETS.find((item) => item.id === preset) ?? PRESETS.find((item) => item.id === '4:5') ?? PRESETS[0]
+  const activePreset = PRESETS.find((item) => item.id === preset) ?? PRESETS.find((item) => item.id === DEFAULT_PRESET) ?? PRESETS[0]
   const aspectW = preset === 'custom' ? customW : activePreset.w
   const aspectH = preset === 'custom' ? customH : activePreset.h
   const safeW = aspectW > 0 ? aspectW : 1
@@ -139,6 +210,10 @@ function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [])
+
+  useEffect(() => {
+    saveUserPrefs({ preset, customW, customH, layout, gutter, exportSize })
+  }, [preset, customW, customH, layout, gutter, exportSize])
 
   useEffect(() => {
     const id = ++packId.current
@@ -186,7 +261,14 @@ function App() {
     const files = Array.from(list).filter(isRaster)
     if (files.length === 0) return
     const loaded = await Promise.all(files.map(loadPhoto))
-    setPhotos((prev) => [...prev, ...loaded])
+    setPhotos((prev) => {
+      const next = [...prev, ...loaded]
+      if (prev.length === 0 && next.length > 0) {
+        setBreakIndex(1)
+        return stamp(next, 1)
+      }
+      return next
+    })
   }
 
   function clearAll() {
