@@ -44,7 +44,7 @@ export type Placement = {
 
 export const PAGE_WIDTH = 1000
 export const FOCUS_MAX_CROP = 0.1
-export const NICHE_MAX_CROP = 0.5
+export const NICHE_MAX_CROP = 0.75
 export const DEFAULT_GUTTER = 2
 export const DEFAULT_LAYOUT: LayoutMode = 'top'
 

@@ -277,6 +277,8 @@ function App() {
           />
         </label>
 
+        <span className="toolbar-split" aria-hidden />
+
         <span className="export-ctrl">
           <select
             value={exportSize}

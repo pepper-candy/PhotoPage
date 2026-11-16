@@ -3,7 +3,17 @@ import type { LayoutMode, PackOptions, Page, Photo, PhotoGroup, Placement, Rect 
 
 const EPS = 0.6
 const FOCUS_ROW_SCALE = 2.2
+const FOCUS_MIN_RATIO = 1.5
 const GAP_PASSES = 5
+
+function cellArea(rect: { w: number; h: number }): number {
+  return Math.max(0, rect.w) * Math.max(0, rect.h)
+}
+
+function nicheAreaCap(focusPlaced: Placement[]): number {
+  if (focusPlaced.length === 0) return Number.POSITIVE_INFINITY
+  return Math.min(...focusPlaced.map(cellArea)) / FOCUS_MIN_RATIO
+}
 
 type Dir = 'right' | 'down' | 'left' | 'up'
 type Limits = { inner: number; hMin: number; hMax: number; hPref: number }
@@ -393,6 +403,7 @@ function tryExpand(
   photo: Photo,
   region: Rect,
   gutter: number,
+  maxArea?: number,
 ): { area: number; next: Placement } | null {
   const gap = availableGap(placement, dir, placements, region, gutter)
   if (gap < EPS) return null
@@ -416,6 +427,20 @@ function tryExpand(
     if (dir === 'up') y = placement.y - grown
   }
 
+  if (maxArea != null && Number.isFinite(maxArea) && w * h > maxArea + EPS) {
+    if (dir === 'right' || dir === 'left') {
+      const limited = maxArea / Math.max(h, 0.001)
+      if (limited <= placement.w + EPS) return null
+      if (dir === 'left') x = placement.x - (limited - placement.w)
+      w = limited
+    } else {
+      const limited = maxArea / Math.max(w, 0.001)
+      if (limited <= placement.h + EPS) return null
+      if (dir === 'up') y = placement.y - (limited - placement.h)
+      h = limited
+    }
+  }
+
   if (
     x < region.x - EPS ||
     y < region.y - EPS ||
@@ -430,7 +455,7 @@ function tryExpand(
     if (other.photoId === placement.photoId) continue
     if (boxesOverlap(box, other, gutter)) return null
   }
-  return { area: w * h - placement.w * placement.h, next: toPlacement(photo, box) }
+  return { area: w * h - placement.w * placement.h, next: fillCell(photo, box) }
 }
 
 function gapFill(
@@ -438,34 +463,49 @@ function gapFill(
   photos: Photo[],
   region: Rect,
   gutter: number,
+  nicheCap?: number,
+  passes = GAP_PASSES,
 ): Placement[] {
   const byId = new Map(photos.map((photo) => [photo.id, photo]))
   const order = new Map(photos.map((photo, index) => [photo.id, index]))
   const placements = start.map((placement) => ({ ...placement }))
   const dirs: Dir[] = ['down', 'right', 'up', 'left']
+  const capOf = (photo: Photo) =>
+    photo.group === 'focus' || nicheCap == null || !Number.isFinite(nicheCap) ? undefined : nicheCap
 
-  for (let pass = 0; pass < GAP_PASSES; pass++) {
-    const candidates: { photoId: string; dir: Dir; area: number }[] = []
+  for (let pass = 0; pass < passes; pass++) {
+    const candidates: { photoId: string; dir: Dir; area: number; focus: boolean }[] = []
     for (const placement of placements) {
       const photo = byId.get(placement.photoId)
       if (!photo) continue
       let best: { dir: Dir; area: number } | null = null
       for (const dir of dirs) {
-        const candidate = tryExpand(placement, dir, placements, photo, region, gutter)
+        const candidate = tryExpand(placement, dir, placements, photo, region, gutter, capOf(photo))
         if (candidate && (!best || candidate.area > best.area)) {
           best = { dir, area: candidate.area }
         }
       }
-      if (best) candidates.push({ photoId: placement.photoId, dir: best.dir, area: best.area })
+      if (best) {
+        candidates.push({
+          photoId: placement.photoId,
+          dir: best.dir,
+          area: best.area,
+          focus: photo.group === 'focus',
+        })
+      }
     }
+    if (candidates.length === 0) break
     candidates.sort(
-      (a, b) => (order.get(b.photoId) ?? 0) - (order.get(a.photoId) ?? 0) || b.area - a.area,
+      (a, b) =>
+        Number(b.focus) - Number(a.focus) ||
+        b.area - a.area ||
+        (order.get(a.photoId) ?? 0) - (order.get(b.photoId) ?? 0),
     )
     for (const candidate of candidates) {
       const placement = placements.find((item) => item.photoId === candidate.photoId)
       const photo = byId.get(candidate.photoId)
       if (!placement || !photo) continue
-      const fresh = tryExpand(placement, candidate.dir, placements, photo, region, gutter)
+      const fresh = tryExpand(placement, candidate.dir, placements, photo, region, gutter, capOf(photo))
       if (!fresh || fresh.area < EPS) continue
       placements[placements.indexOf(placement)] = fresh.next
     }
@@ -511,6 +551,90 @@ function healthyArea(region: Rect): number {
   return edge * edge
 }
 
+function minFocusCellArea(
+  page: Rect,
+  focusCount: number,
+  nicheCount: number,
+  includeAll: boolean,
+): number {
+  const usable = Math.max(1, cellArea(page) * 0.94)
+  if (focusCount <= 0) return 0
+  const healthy = healthyArea(page)
+  const nPack = includeAll
+    ? Math.max(0, nicheCount)
+    : Math.max(0, Math.min(nicheCount, Math.floor((usable * 0.9) / Math.max(healthy, 1))))
+  const denom = FOCUS_ROW_SCALE * focusCount + nPack
+  return (usable * FOCUS_ROW_SCALE) / Math.max(denom, FOCUS_ROW_SCALE * focusCount)
+}
+
+function splitRect(region: Rect, gutter: number): [Rect, Rect] | null {
+  const g = Math.max(0, gutter)
+  if (region.w >= region.h && region.w > g + 28) {
+    const w1 = (region.w - g) / 2
+    if (w1 < 12 || region.w - w1 - g < 12) return null
+    return [
+      { x: region.x, y: region.y, w: w1, h: region.h },
+      { x: region.x + w1 + g, y: region.y, w: region.w - w1 - g, h: region.h },
+    ]
+  }
+  if (region.h > g + 28) {
+    const h1 = (region.h - g) / 2
+    if (h1 < 12 || region.h - h1 - g < 12) return null
+    return [
+      { x: region.x, y: region.y, w: region.w, h: h1 },
+      { x: region.x, y: region.y + h1 + g, w: region.w, h: region.h - h1 - g },
+    ]
+  }
+  return null
+}
+
+function splitPhotosByArea(photos: Photo[], a: Rect, b: Rect): [Photo[], Photo[]] {
+  if (photos.length <= 1) return [photos.slice(), []]
+  const wa = Math.max(1, cellArea(a))
+  const wb = Math.max(1, cellArea(b))
+  const n0 = clamp(Math.round((photos.length * wa) / (wa + wb)), 1, photos.length - 1)
+  return [photos.slice(0, n0), photos.slice(n0)]
+}
+
+function boxForArea(photo: Photo, area: number, maxW: number, maxH: number): { w: number; h: number } {
+  const { min, max } = legalAspectRange(photo)
+  const aspect = clamp(preferredAspect(photo), min, max)
+  let h = Math.sqrt(Math.max(1, area) / Math.max(aspect, 0.001))
+  let w = h * aspect
+  if (w > maxW) {
+    w = Math.max(1, maxW)
+    h = w / aspect
+  }
+  if (h > maxH) {
+    h = Math.max(1, maxH)
+    w = h * aspect
+  }
+  if (w > maxW) {
+    w = Math.max(1, maxW)
+    h = w / aspect
+  }
+  return { w: Math.max(1, w), h: Math.max(1, h) }
+}
+
+function cappedCell(photo: Photo, region: Rect, maxArea: number, gutter: number): Placement | null {
+  const cap = Math.max(1, maxArea)
+  const { min, max } = legalAspectRange(photo)
+  const aspect = clamp(preferredAspect(photo), min, max)
+  let h = Math.sqrt(cap / aspect)
+  let w = h * aspect
+  w = Math.min(w, region.w)
+  h = Math.min(h, region.h)
+  if (w * h > cap) {
+    const scale = Math.sqrt(cap / Math.max(w * h, 0.001))
+    w *= scale
+    h *= scale
+  }
+  if (w < 8 || h < 8) return null
+  const g = Math.max(0, gutter)
+  if (w > region.w - g && h > region.h - g) return null
+  return fillCell(photo, { x: region.x, y: region.y, w, h })
+}
+
 function fillCell(photo: Photo, box: Rect): Placement {
   const a = box.w / Math.max(box.h, 0.001)
   const { min, max } = legalAspectRange(photo)
@@ -537,20 +661,26 @@ function chooseSlice(
   includeAll: boolean,
   targetArea: number,
   depth: number,
+  maxArea?: number,
 ): { cell: Rect; rest: Rect } | null {
   if (remaining <= 1 || region.w < 16 || region.h < 16) return null
   const { min, max } = legalAspectRange(photo)
   const g = Math.max(0, gutter)
-  const regionArea = region.w * region.h
-  const want = includeAll ? regionArea / remaining : Math.min(targetArea, regionArea * 0.58)
-  const minRest = includeAll ? 12 : Math.sqrt(targetArea) * 0.55
+  const regionArea = cellArea(region)
+  const cap = maxArea ?? Number.POSITIVE_INFINITY
+  const want = Math.min(
+    includeAll ? regionArea / remaining : Math.min(targetArea, regionArea * 0.58),
+    cap,
+  )
+  const minRest = includeAll || remaining <= 2 ? 12 : Math.sqrt(Math.max(1, targetArea)) * 0.55
 
   const vertical = (cellW: number): { cell: Rect; rest: Rect } | null => {
     if (cellW < 12 || cellW > region.w - g - 12) return null
     const aspect = cellW / region.h
     if (aspect < min - 0.02 || aspect > max + 0.02) return null
+    if (cellW * region.h > cap + EPS) return null
     const restW = region.w - cellW - g
-    if (restW < minRest && !includeAll) return null
+    if (restW < minRest && !includeAll && remaining > 2) return null
     if (restW < 12) return null
     return {
       cell: { x: region.x, y: region.y, w: cellW, h: region.h },
@@ -561,8 +691,9 @@ function chooseSlice(
     if (cellH < 12 || cellH > region.h - g - 12) return null
     const aspect = region.w / cellH
     if (aspect < min - 0.02 || aspect > max + 0.02) return null
+    if (region.w * cellH > cap + EPS) return null
     const restH = region.h - cellH - g
-    if (restH < minRest && !includeAll) return null
+    if (restH < minRest && !includeAll && remaining > 2) return null
     if (restH < 12) return null
     return {
       cell: { x: region.x, y: region.y, w: region.w, h: cellH },
@@ -570,11 +701,57 @@ function chooseSlice(
     }
   }
 
-  const vFromArea = clamp(want / region.h, min * region.h, max * region.h)
-  const hFromArea = clamp(want / region.w, region.w / max, region.w / min)
+  const vCap = Math.min(max * region.h, cap / Math.max(region.h, 0.001))
+  const hCap = Math.min(region.w / min, cap / Math.max(region.w, 0.001))
+  const vFromArea = clamp(want / region.h, min * region.h, vCap)
+  const hFromArea = clamp(want / region.w, region.w / max, hCap)
   const preferV = depth % 2 === 0 ? region.w >= region.h : region.w > region.h * 1.12
-  if (preferV) return vertical(vFromArea) ?? horizontal(hFromArea) ?? vertical(min * region.h) ?? horizontal(region.w / max)
-  return horizontal(hFromArea) ?? vertical(vFromArea) ?? horizontal(region.w / max) ?? vertical(min * region.h)
+  if (preferV) {
+    return (
+      vertical(vFromArea) ??
+      horizontal(hFromArea) ??
+      vertical(Math.min(min * region.h, vCap)) ??
+      horizontal(Math.min(region.w / max, hCap))
+    )
+  }
+  return (
+    horizontal(hFromArea) ??
+    vertical(vFromArea) ??
+    horizontal(Math.min(region.w / max, hCap)) ??
+    vertical(Math.min(min * region.h, vCap))
+  )
+}
+
+function packIntoHalves(
+  photos: Photo[],
+  parts: [Rect, Rect],
+  gutter: number,
+  includeAll: boolean,
+  maxArea: number | undefined,
+  goal: number,
+  depth: number,
+): Placement[] {
+  if (includeAll && photos.length > 1) {
+    const [g0, g1] = splitPhotosByArea(photos, parts[0], parts[1])
+    return [
+      ...slicePack(g0, parts[0], gutter, includeAll, maxArea, goal, depth + 1),
+      ...slicePack(g1, parts[1], gutter, includeAll, maxArea, goal, depth + 1),
+    ]
+  }
+  const first = slicePack(photos, parts[0], gutter, includeAll, maxArea, goal, depth + 1)
+  const used = new Set(first.map((item) => item.photoId))
+  return [
+    ...first,
+    ...slicePack(
+      photos.filter((photo) => !used.has(photo.id)),
+      parts[1],
+      gutter,
+      includeAll,
+      maxArea,
+      goal,
+      depth + 1,
+    ),
+  ]
 }
 
 function slicePack(
@@ -582,49 +759,60 @@ function slicePack(
   region: Rect,
   gutter: number,
   includeAll: boolean,
+  maxArea?: number,
   targetArea?: number,
   depth = 0,
 ): Placement[] {
   if (photos.length === 0 || region.w < 8 || region.h < 8) return []
-  const goal = targetArea ?? (includeAll ? (region.w * region.h) / photos.length : healthyArea(region))
-  if (photos.length === 1) return [fillCell(photos[0], region)]
-
-  if (!includeAll && region.w * region.h <= goal * 1.15) {
+  const cap = maxArea ?? Number.POSITIVE_INFINITY
+  const regionArea = cellArea(region)
+  const goal = Math.min(
+    targetArea ?? (includeAll ? regionArea / photos.length : healthyArea(region)),
+    cap,
+  )
+  if (depth > 48) {
+    if (cap < Infinity && regionArea > cap + EPS) {
+      const capped = cappedCell(photos[0], region, cap, gutter)
+      return capped ? [capped] : includeAll ? [fillCell(photos[0], region)] : []
+    }
     return [fillCell(photos[0], region)]
   }
 
-  const cut = chooseSlice(photos[0], region, photos.length, gutter, includeAll, goal, depth)
-  if (!cut) return [fillCell(photos[0], region)]
+  const tooBig = cap < Infinity && regionArea > cap + EPS
+  if (tooBig) {
+    const parts = splitRect(region, gutter)
+    if (parts) return packIntoHalves(photos, parts, gutter, includeAll, maxArea, goal, depth)
+  }
+
+  if (photos.length === 1) {
+    if (tooBig) {
+      const cut = chooseSlice(photos[0], region, 2, gutter, true, goal, depth, maxArea)
+      if (cut && cellArea(cut.cell) <= cap + EPS) return [fillCell(photos[0], cut.cell)]
+      const capped = cappedCell(photos[0], region, cap, gutter)
+      return capped ? [capped] : includeAll ? [fillCell(photos[0], region)] : []
+    }
+    return [fillCell(photos[0], region)]
+  }
+
+  if (!includeAll && regionArea <= goal * 1.15 && regionArea <= cap + EPS) {
+    return [fillCell(photos[0], region)]
+  }
+
+  const cut = chooseSlice(photos[0], region, photos.length, gutter, includeAll, goal, depth, maxArea)
+  if (!cut) {
+    const parts = splitRect(region, gutter)
+    if (parts) return packIntoHalves(photos, parts, gutter, includeAll, maxArea, goal, depth)
+    if (cap < Infinity && regionArea > cap + EPS) {
+      const capped = cappedCell(photos[0], region, cap, gutter)
+      return capped ? [capped] : includeAll ? [fillCell(photos[0], region)] : []
+    }
+    return [fillCell(photos[0], region)]
+  }
 
   return [
     fillCell(photos[0], cut.cell),
-    ...slicePack(photos.slice(1), cut.rest, gutter, includeAll, goal, depth + 1),
+    ...slicePack(photos.slice(1), cut.rest, gutter, includeAll, maxArea, goal, depth + 1),
   ]
-}
-
-function fillRemainingHoles(
-  placed: Placement[],
-  unused: Photo[],
-  page: Rect,
-  gutter: number,
-  tagged: Photo[],
-  includeAll: boolean,
-): Placement[] {
-  let placements = placed.slice()
-  let remaining = unused.slice()
-  const minCell = Math.max(28, gutter + 8)
-  for (let pass = 0; pass < 24 && remaining.length > 0; pass++) {
-    const holes = freeRects(page, placements, gutter)
-      .filter((rect) => rect.w >= minCell && rect.h >= minCell)
-      .sort((a, b) => b.w * b.h - a.w * a.h)
-    if (holes.length === 0) break
-    const hole = holes[0]
-    const extra = slicePack(remaining, hole, gutter, includeAll)
-    if (extra.length === 0) break
-    placements = [...placements, ...extra]
-    remaining = remaining.filter((photo) => !extra.some((item) => item.photoId === photo.id))
-  }
-  return gapFill(placements, tagged, page, gutter)
 }
 
 function riverFill(
@@ -736,20 +924,65 @@ function splitByArea(photos: Photo[], rects: Rect[]): Photo[][] {
   return groups
 }
 
-function placeFocus(focus: Photo[], page: Rect, gutter: number, nicheCount: number): Placement[] {
-  const { focusH, focusCap } = planFocus(page.h, gutter, focus.length, nicheCount)
-  let target = focusH
+function placeFocus(
+  focus: Photo[],
+  page: Rect,
+  gutter: number,
+  nicheCount: number,
+  includeAll: boolean,
+): Placement[] {
+  const targetA = minFocusCellArea(page, focus.length, nicheCount, includeAll)
+  const { focusH, focusCap } = planFocus(page.h, gutter, focus.length, Math.max(1, nicheCount))
+  const cols = Math.max(1, Math.round(Math.sqrt(focus.length)))
+  const minRowH = targetA / Math.max(1, (page.w - (cols - 1) * gutter) / cols)
+  let target = Math.max(focusH, minRowH)
   let rows = partitionByTarget(focus, page.w, gutter, target)
-  const maxH = Math.max(48, focusCap)
+  const minLeftover = Math.max(36, page.h * 0.14)
+  const maxH = Math.max(
+    48,
+    Math.min(
+      page.h - gutter - minLeftover,
+      Math.max(focusCap, rows.length * target + Math.max(0, rows.length - 1) * gutter),
+    ),
+  )
   for (let i = 0; i < 8; i++) {
     const probe = layoutRows(rows, { ...page, h: page.h }, gutter, false, target)
     const used = probe.reduce((max, placement) => Math.max(max, placement.y + placement.h), 0)
     if (used <= maxH + 1) break
-    target = Math.max(32, target * 0.72)
+    target = Math.max(minRowH * 0.9, target * 0.72)
     rows = partitionByTarget(focus, page.w, gutter, target)
   }
   const region = { x: page.x, y: page.y, w: page.w, h: maxH }
   return layoutRows(rows, region, gutter, false, target)
+}
+
+function packNicheRects(
+  niche: Photo[],
+  rects: Rect[],
+  gutter: number,
+  includeAll: boolean,
+  maxArea: number,
+): Placement[] {
+  if (rects.length === 0 || niche.length === 0) return []
+  const nichePlaced: Placement[] = []
+  if (includeAll) {
+    const groups = splitByArea(niche, rects)
+    for (let index = 0; index < rects.length; index++) {
+      const group = groups[index] ?? []
+      if (group.length === 0) continue
+      nichePlaced.push(...slicePack(group, rects[index], gutter, true, maxArea))
+    }
+    return nichePlaced
+  }
+  let remaining = niche.slice()
+  for (const rect of rects) {
+    if (remaining.length === 0) break
+    const packed = slicePack(remaining, rect, gutter, false, maxArea)
+    const used = new Set(packed.map((item) => item.photoId))
+    remaining = remaining.filter((photo) => !used.has(photo.id))
+    nichePlaced.push(...packed)
+  }
+  return nichePlaced
 }
 
 function packTopMixed(
@@ -760,24 +993,11 @@ function packTopMixed(
   tagged: Photo[],
   includeAll: boolean,
 ): Placement[] {
-  const focusPlaced = placeFocus(focus, full, gutter, includeAll ? niche.length : Math.max(1, Math.min(niche.length, 8)))
+  const focusPlaced = placeFocus(focus, full, gutter, niche.length, includeAll)
+  const cap = nicheAreaCap(focusPlaced)
   const rects = sideAndBottom(full, focusPlaced, gutter)
-  let nichePlaced: Placement[]
-  if (includeAll) {
-    const groups = splitByArea(niche, rects)
-    nichePlaced = rects.flatMap((rect, index) => riverFill(groups[index] ?? [], rect, gutter, undefined, true))
-  } else {
-    let remaining = niche.slice()
-    nichePlaced = []
-    for (const rect of rects) {
-      if (remaining.length === 0) break
-      const placed = riverFill(remaining, rect, gutter, undefined, false)
-      const used = new Set(placed.map((item) => item.photoId))
-      remaining = remaining.filter((photo) => !used.has(photo.id))
-      nichePlaced.push(...placed)
-    }
-  }
-  return gapFill([...focusPlaced, ...nichePlaced], tagged, full, gutter)
+  const nichePlaced = packNicheRects(niche, rects, gutter, includeAll, cap)
+  return gapFill([...focusPlaced, ...nichePlaced], tagged, full, gutter, cap)
 }
 
 function flipY(placements: Placement[], pageH: number): Placement[] {
@@ -785,22 +1005,6 @@ function flipY(placements: Placement[], pageH: number): Placement[] {
     ...placement,
     y: pageH - placement.y - placement.h,
   }))
-}
-
-function sizedBox(photo: Photo, maxW: number, maxH: number): { w: number; h: number } {
-  const { min, max } = legalAspectRange(photo)
-  const aspect = clamp(preferredAspect(photo), min, max)
-  let w = Math.max(1, maxW)
-  let h = w / aspect
-  if (h > maxH) {
-    h = Math.max(1, maxH)
-    w = h * aspect
-  }
-  if (w > maxW) {
-    w = Math.max(1, maxW)
-    h = w / aspect
-  }
-  return { w: Math.max(1, w), h: Math.max(1, h) }
 }
 
 function inflate(rect: Rect, pad: number): Rect {
@@ -812,20 +1016,21 @@ function subtractRect(free: Rect, used: Rect, gutter: number): Rect[] {
   if (!boxesOverlap(free, blocked, 0)) return [free]
   const gap = gutter
   const out: Rect[] = []
+  const minPiece = gutter + EPS
   const topH = blocked.y - gap - free.y
-  if (topH > 8) out.push({ x: free.x, y: free.y, w: free.w, h: topH })
+  if (topH > minPiece) out.push({ x: free.x, y: free.y, w: free.w, h: topH })
   const bottomY = blocked.y + blocked.h + gap
   const bottomH = free.y + free.h - bottomY
-  if (bottomH > 8) out.push({ x: free.x, y: bottomY, w: free.w, h: bottomH })
+  if (bottomH > minPiece) out.push({ x: free.x, y: bottomY, w: free.w, h: bottomH })
   const top = Math.max(free.y, blocked.y)
   const bot = Math.min(free.y + free.h, blocked.y + blocked.h)
   const midH = bot - top
-  if (midH > 8) {
+  if (midH > minPiece) {
     const leftW = blocked.x - gap - free.x
-    if (leftW > 8) out.push({ x: free.x, y: top, w: leftW, h: midH })
+    if (leftW > minPiece) out.push({ x: free.x, y: top, w: leftW, h: midH })
     const rightX = blocked.x + blocked.w + gap
     const rightW = free.x + free.w - rightX
-    if (rightW > 8) out.push({ x: rightX, y: top, w: rightW, h: midH })
+    if (rightW > minPiece) out.push({ x: rightX, y: top, w: rightW, h: midH })
   }
   return out
 }
@@ -838,50 +1043,6 @@ function freeRects(page: Rect, occupied: Placement[], gutter: number): Rect[] {
   return free
 }
 
-function splitForStrips(photos: Photo[], rects: Rect[]): Photo[][] {
-  if (rects.length === 0) return []
-  if (rects.length === 1) return [photos.slice()]
-  const assigned = rects.map((rect) => {
-    const aspect = rect.w / Math.max(1, rect.h)
-    if (aspect >= 2.2) return Math.max(1, Math.round(rect.w / (rect.h * 1.35)))
-    if (aspect <= 0.45) return Math.max(1, Math.round(rect.h / (rect.w * 1.35)))
-    return 1
-  })
-  let total = assigned.reduce((sum, count) => sum + count, 0)
-  const areaOf = (index: number) => rects[index].w * rects[index].h
-  while (total > photos.length) {
-    let idx = -1
-    assigned.forEach((count, index) => {
-      if (count <= 0) return
-      if (idx < 0 || count > assigned[idx] || (count === assigned[idx] && areaOf(index) < areaOf(idx))) {
-        idx = index
-      }
-    })
-    if (idx < 0 || (assigned[idx] <= 1 && total - 1 < rects.filter((_, i) => assigned[i] > 0).length)) {
-      if (idx < 0) break
-      assigned[idx] -= 1
-      total -= 1
-      continue
-    }
-    assigned[idx] -= 1
-    total -= 1
-  }
-  if (total < photos.length) {
-    const order = rects
-      .map((rect, index) => ({ index, area: rect.w * rect.h }))
-      .sort((a, b) => b.area - a.area)
-    let extra = photos.length - total
-    for (let i = 0; extra > 0; i++, extra--) assigned[order[i % order.length].index] += 1
-  }
-  const groups: Photo[][] = []
-  let cursor = 0
-  for (const count of assigned) {
-    groups.push(photos.slice(cursor, cursor + count))
-    cursor += count
-  }
-  return groups
-}
-
 function fillLeftovers(
   niche: Photo[],
   occupied: Placement[],
@@ -890,31 +1051,15 @@ function fillLeftovers(
   tagged: Photo[],
   includeAll: boolean,
 ): Placement[] {
+  const cap = nicheAreaCap(occupied)
   const rects = freeRects(page, occupied, gutter)
     .filter((rect) => rect.w > 48 && rect.h > 36)
     .sort((a, b) => a.y - b.y || a.x - b.x)
   if (rects.length === 0 || niche.length === 0) {
-    return gapFill(occupied, tagged, page, gutter)
+    return gapFill(occupied, tagged, page, gutter, cap)
   }
-  let remaining = niche.slice()
-  const nichePlaced: Placement[] = []
-  if (includeAll) {
-    const groups = splitForStrips(niche, rects)
-    for (let index = 0; index < rects.length; index++) {
-      const group = groups[index] ?? []
-      if (group.length === 0) continue
-      nichePlaced.push(...slicePack(group, rects[index], gutter, true))
-    }
-  } else {
-    for (const rect of rects) {
-      if (remaining.length === 0) break
-      const packed = slicePack(remaining, rect, gutter, false)
-      const used = new Set(packed.map((item) => item.photoId))
-      remaining = remaining.filter((photo) => !used.has(photo.id))
-      nichePlaced.push(...packed)
-    }
-  }
-  return gapFill([...occupied, ...nichePlaced], tagged, page, gutter)
+  const nichePlaced = packNicheRects(niche, rects, gutter, includeAll, cap)
+  return gapFill([...occupied, ...nichePlaced], tagged, page, gutter, cap)
 }
 
 function splitRegions(rect: Rect, count: number, gutter: number): Rect[] {
@@ -1014,16 +1159,18 @@ function packScattered(
     )
   }
 
+  const targetA = minFocusCellArea(full, focus.length, niche.length, includeAll)
   const regions = splitRegions(full, focus.length, gutter)
   const leftover: Rect[] = []
   const focusPlaced = focus.map((photo, index) => {
     const region = regions[Math.min(index, regions.length - 1)]
-    const cut = spanSlice(photo, region, gutter, index + 1, 0.7)
+    const share = clamp(Math.max(0.64, targetA / Math.max(1, cellArea(region))), 0.64, 0.86)
+    const cut = spanSlice(photo, region, gutter, index + 1, share)
     if (cut) {
       if (cut.rest.w > 40 && cut.rest.h > 40) leftover.push(cut.rest)
-      return toPlacement(photo, cut.box)
+      return fillCell(photo, cut.box)
     }
-    const fallback = sizedBox(photo, region.w * 0.9, region.h * 0.82)
+    const fallback = boxForArea(photo, targetA, region.w * 0.9, region.h * 0.86)
     const box = {
       x: region.x + (index % 2 === 0 ? 0 : Math.max(0, region.w - fallback.w)),
       y: region.y + (index % 4 < 2 ? 0 : Math.max(0, region.h - fallback.h)),
@@ -1033,36 +1180,20 @@ function packScattered(
     leftover.push(
       ...freeRects(region, [{ ...box, photoId: photo.id, sx: 0, sy: 0, sw: 1, sh: 1 }], gutter),
     )
-    return toPlacement(photo, box)
+    return fillCell(photo, box)
   })
   if (niche.length === 0) {
     return gapFill(focusPlaced, focus, full, gutter)
   }
 
+  const cap = nicheAreaCap(focusPlaced)
   const rects = (leftover.length ? leftover : freeRects(full, focusPlaced, gutter))
     .filter((rect) => rect.w > 40 && rect.h > 40)
     .sort((a, b) => a.y - b.y || a.x - b.x)
-  if (rects.length === 0) return gapFill(focusPlaced, tagged, full, gutter)
+  if (rects.length === 0) return gapFill(focusPlaced, tagged, full, gutter, cap)
 
-  let remaining = niche.slice()
-  const nichePlaced: Placement[] = []
-  if (includeAll) {
-    const groups = splitByArea(niche, rects)
-    for (let index = 0; index < rects.length; index++) {
-      const group = groups[index] ?? []
-      if (group.length === 0) continue
-      nichePlaced.push(...slicePack(group, rects[index], gutter, true))
-    }
-  } else {
-    for (const rect of rects) {
-      if (remaining.length === 0) break
-      const packed = slicePack(remaining, rect, gutter, false)
-      const used = new Set(packed.map((item) => item.photoId))
-      remaining = remaining.filter((photo) => !used.has(photo.id))
-      nichePlaced.push(...packed)
-    }
-  }
-  return gapFill([...focusPlaced, ...nichePlaced], tagged, full, gutter)
+  const nichePlaced = packNicheRects(niche, rects, gutter, includeAll, cap)
+  return gapFill([...focusPlaced, ...nichePlaced], tagged, full, gutter, cap)
 }
 
 function packRing(
@@ -1073,26 +1204,30 @@ function packRing(
   tagged: Photo[],
   includeAll: boolean,
 ): Placement[] {
-  const { focusH } = planFocus(full.h, gutter, focus.length, Math.max(1, niche.length))
+  const n = focus.length
+  const targetA = minFocusCellArea(full, n, niche.length, includeAll)
   const cx = full.x + full.w / 2
   const cy = full.y + full.h / 2
-  const n = focus.length
-  let size = focusH
+  let size = Math.sqrt(Math.max(1, targetA))
   let rx = full.w * 0.33
   let ry = full.h * 0.33
   if (n > 1) {
     const spacing = (Math.PI * (rx + ry)) / n
-    size = Math.min(size, spacing * 0.7)
+    if (size > spacing * 0.85) {
+      const grow = size / Math.max(1, spacing * 0.85)
+      rx = Math.min(full.w * 0.42, rx * grow)
+      ry = Math.min(full.h * 0.42, ry * grow)
+    }
   }
 
   let focusPlaced: Placement[] = []
   for (let attempt = 0; attempt < 12; attempt++) {
     focusPlaced = focus.map((photo, index) => {
       const angle = -Math.PI / 2 + (n === 0 ? 0 : (2 * Math.PI * index) / n)
-      const { w, h } = sizedBox(photo, full.w * 0.46, size)
+      const { w, h } = boxForArea(photo, targetA, full.w * 0.5, Math.max(size, Math.sqrt(targetA) * 1.35))
       const x = clamp(cx + Math.cos(angle) * rx - w / 2, full.x, full.x + full.w - w)
       const y = clamp(cy + Math.sin(angle) * ry - h / 2, full.y, full.y + full.h - h)
-      return toPlacement(photo, { x, y, w, h })
+      return fillCell(photo, { x, y, w, h })
     })
     let hits = 0
     for (let i = 0; i < focusPlaced.length; i++) {
@@ -1101,9 +1236,9 @@ function packRing(
       }
     }
     if (hits === 0) break
-    size = Math.max(36, size * 0.82)
-    rx = Math.min(full.w * 0.4, rx * 1.04)
-    ry = Math.min(full.h * 0.4, ry * 1.04)
+    rx = Math.min(full.w * 0.44, rx * 1.06)
+    ry = Math.min(full.h * 0.44, ry * 1.06)
+    if (attempt > 6) size = Math.max(Math.sqrt(targetA) * 0.9, size * 0.92)
   }
 
   return fillLeftovers(niche, focusPlaced, full, gutter, tagged, includeAll)
@@ -1117,12 +1252,182 @@ function packCenter(
   tagged: Photo[],
   includeAll: boolean,
 ): Placement[] {
-  const raw = placeFocus(focus, full, gutter, includeAll ? niche.length : Math.max(1, Math.min(niche.length, 8)))
+  const raw = placeFocus(focus, full, gutter, niche.length, includeAll)
   const minY = Math.min(...raw.map((item) => item.y))
   const maxY = Math.max(...raw.map((item) => item.y + item.h))
   const dy = full.y + full.h / 2 - (minY + maxY) / 2
   const shifted = raw.map((item) => ({ ...item, y: item.y + dy }))
   return fillLeftovers(niche, shifted, full, gutter, tagged, includeAll)
+}
+
+function leftoverHoles(page: Rect, placements: Placement[], gutter: number): Rect[] {
+  const minSide = gutter + EPS
+  return freeRects(page, placements, gutter)
+    .filter((rect) => rect.w > minSide && rect.h > minSide)
+    .sort((a, b) => b.w * b.h - a.w * a.h)
+}
+
+function edgeSide(cell: Rect, hole: Rect, gutter: number): Dir | null {
+  const g = Math.max(0, gutter)
+  const tol = Math.max(2, g + 1)
+  const vert = cell.y < hole.y + hole.h - EPS && hole.y < cell.y + cell.h - EPS
+  const horz = cell.x < hole.x + hole.w - EPS && hole.x < cell.x + cell.w - EPS
+  if (vert && Math.abs(cell.x + cell.w + g - hole.x) <= tol) return 'right'
+  if (vert && Math.abs(hole.x + hole.w + g - cell.x) <= tol) return 'left'
+  if (horz && Math.abs(cell.y + cell.h + g - hole.y) <= tol) return 'down'
+  if (horz && Math.abs(hole.y + hole.h + g - cell.y) <= tol) return 'up'
+  if (vert && hole.x >= cell.x + cell.w - EPS && hole.x - (cell.x + cell.w) <= g + tol) return 'right'
+  if (vert && cell.x >= hole.x + hole.w - EPS && cell.x - (hole.x + hole.w) <= g + tol) return 'left'
+  if (horz && hole.y >= cell.y + cell.h - EPS && hole.y - (cell.y + cell.h) <= g + tol) return 'down'
+  if (horz && cell.y >= hole.y + hole.h - EPS && cell.y - (hole.y + hole.h) <= g + tol) return 'up'
+  return null
+}
+
+function expandToward(
+  placement: Placement,
+  hole: Rect,
+  side: Dir,
+  photo: Photo,
+  others: Placement[],
+  page: Rect,
+  gutter: number,
+  maxArea?: number,
+): Placement | null {
+  const { min: aMin, max: aMax } = legalAspectRange(photo)
+  const areaLimit = maxArea != null && Number.isFinite(maxArea) ? maxArea : Number.POSITIVE_INFINITY
+  let x = placement.x
+  let y = placement.y
+  let w = placement.w
+  let h = placement.h
+
+  if (side === 'right' || side === 'left') {
+    const limitW = Math.min(aMax * h, areaLimit / Math.max(h, 0.001))
+    if (side === 'right') {
+      w = Math.min(Math.max(w, hole.x + hole.w - x), limitW, page.x + page.w - x)
+    } else {
+      w = Math.min(Math.max(w, x + w - hole.x), limitW, x + w - page.x)
+      x = placement.x + placement.w - w
+    }
+  } else {
+    const limitH = Math.min(
+      w / Math.max(aMin, 0.001),
+      areaLimit / Math.max(w, 0.001),
+    )
+    if (side === 'down') {
+      h = Math.min(Math.max(h, hole.y + hole.h - y), limitH, page.y + page.h - y)
+    } else {
+      h = Math.min(Math.max(h, y + h - hole.y), limitH, y + h - page.y)
+      y = placement.y + placement.h - h
+    }
+  }
+
+  if (w <= placement.w + EPS && h <= placement.h + EPS) return null
+  if (
+    x < page.x - EPS ||
+    y < page.y - EPS ||
+    x + w > page.x + page.w + EPS ||
+    y + h > page.y + page.h + EPS
+  ) {
+    return null
+  }
+  const box = { x, y, w, h }
+  for (const other of others) {
+    if (other.photoId === placement.photoId) continue
+    if (boxesOverlap(box, other, gutter)) return null
+  }
+  const next = fillCell(photo, box)
+  if (cellArea(next) <= cellArea(placement) + EPS) return null
+  return next
+}
+
+function placeIntoHole(
+  remaining: Photo[],
+  hole: Rect,
+  gutter: number,
+  includeAll: boolean,
+  maxArea: number,
+): Placement[] {
+  if (remaining.length === 0 || hole.w <= gutter + EPS || hole.h <= gutter + EPS) return []
+  const extra = slicePack(remaining, hole, gutter, includeAll, maxArea)
+  if (extra.length > 0) return extra
+  const parts = splitRect(hole, gutter)
+  if (!parts) return []
+  const first = slicePack(remaining, parts[0], gutter, includeAll, maxArea)
+  if (first.length > 0) return first
+  return slicePack(remaining, parts[1], gutter, includeAll, maxArea)
+}
+
+function coverPage(
+  placed: Placement[],
+  tagged: Photo[],
+  page: Rect,
+  gutter: number,
+  unused: Photo[],
+  includeAll: boolean,
+): Placement[] {
+  const byId = new Map(tagged.map((photo) => [photo.id, photo]))
+  const focusIds = new Set(tagged.filter((photo) => photo.group === 'focus').map((photo) => photo.id))
+  let placements = placed.map((item) => ({ ...item }))
+  let remaining = unused.slice()
+
+  for (let pass = 0; pass < 80; pass++) {
+    const cap = nicheAreaCap(placements.filter((item) => focusIds.has(item.photoId)))
+    placements = gapFill(placements, tagged, page, gutter, cap, 6)
+
+    const holes = leftoverHoles(page, placements, gutter)
+    if (holes.length === 0) break
+
+    let progressed = false
+    for (const hole of holes) {
+      const neighbors = placements
+        .map((item, index) => ({ item, index, side: edgeSide(item, hole, gutter) }))
+        .filter((entry) => entry.side)
+        .sort((a, b) => {
+          const af = Number(focusIds.has(a.item.photoId))
+          const bf = Number(focusIds.has(b.item.photoId))
+          if (af !== bf) return bf - af
+          return cellArea(b.item) - cellArea(a.item)
+        })
+      for (const neighbor of neighbors) {
+        const photo = byId.get(neighbor.item.photoId)
+        if (!photo) continue
+        const maxArea = photo.group === 'focus' ? undefined : cap
+        const next = expandToward(
+          neighbor.item,
+          hole,
+          neighbor.side as Dir,
+          photo,
+          placements,
+          page,
+          gutter,
+          maxArea,
+        )
+        if (!next) continue
+        placements[neighbor.index] = next
+        progressed = true
+        break
+      }
+      if (progressed) break
+    }
+
+    if (progressed) continue
+
+    if (remaining.length > 0) {
+      for (const hole of holes) {
+        const extra = placeIntoHole(remaining, hole, gutter, includeAll, cap)
+        if (extra.length === 0) continue
+        placements = [...placements, ...extra]
+        remaining = remaining.filter((photo) => !extra.some((item) => item.photoId === photo.id))
+        progressed = true
+        break
+      }
+    }
+
+    if (!progressed) break
+  }
+
+  const cap = nicheAreaCap(placements.filter((item) => focusIds.has(item.photoId)))
+  return gapFill(placements, tagged, page, gutter, cap, 10)
 }
 
 function finish(placed: Placement[]): Placement[] {
@@ -1161,13 +1466,9 @@ export function pack(photos: Photo[], page: Page, options: PackOptions): Placeme
     placed = packTopMixed(focus, niche, full, gutter, tagged, includeAll)
   }
 
-  if (!includeAll) {
-    const used = new Set(placed.map((item) => item.photoId))
-    const leftover = niche.filter((photo) => !used.has(photo.id))
-    if (leftover.length > 0) {
-      placed = fillRemainingHoles(placed, leftover, full, gutter, tagged, false)
-    }
-  }
+  const used = new Set(placed.map((item) => item.photoId))
+  const leftover = niche.filter((photo) => !used.has(photo.id))
+  placed = coverPage(placed, tagged, full, gutter, leftover, includeAll)
 
   return finish(placed)
 }

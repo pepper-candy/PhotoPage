@@ -52,6 +52,13 @@
   cursor: pointer;
 }
 
+.toolbar-split {
+  width: 1px;
+  height: 16px;
+  background: var(--border);
+  flex: none;
+}
+
 .export-ctrl {
   display: inline-flex;
   align-items: center;
