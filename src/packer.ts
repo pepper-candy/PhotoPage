@@ -1775,66 +1775,6 @@ function splitRegions(rect: Rect, count: number, gutter: number): Rect[] {
   return [...splitRegions(top, leftN, gutter), ...splitRegions(bottom, rightN, gutter)]
 }
 
-function spanSlice(
-  photo: Photo,
-  region: Rect,
-  gutter: number,
-  toward: number,
-  share: number,
-): { box: Rect; rest: Rect } | null {
-  const { min, max } = legalAspectRange(photo)
-  const pref = preferredAspect(photo)
-  const tryH = () => {
-    const hLo = region.w / max
-    const hHi = region.w / min
-    if (hLo > region.h - gutter - 8 || hHi < 12) return null
-    let h = clamp(region.w / pref, hLo, hHi)
-    h = Math.min(h, Math.max(12, (region.h - gutter) * share), region.h - gutter - 12)
-    if (h < 12) return null
-    const fromTop = toward % 4 < 2
-    const box = {
-      x: region.x,
-      y: fromTop ? region.y : region.y + region.h - h,
-      w: region.w,
-      h,
-    }
-    const restH = region.h - h - gutter
-    if (restH < 8) return null
-    const rest = {
-      x: region.x,
-      y: fromTop ? region.y + h + gutter : region.y,
-      w: region.w,
-      h: restH,
-    }
-    return { box, rest }
-  }
-  const tryW = () => {
-    const wLo = region.h * min
-    const wHi = region.h * max
-    if (wLo > region.w - gutter - 8 || wHi < 12) return null
-    let w = clamp(pref * region.h, wLo, wHi)
-    w = Math.min(w, Math.max(12, (region.w - gutter) * share), region.w - gutter - 12)
-    if (w < 12) return null
-    const fromLeft = toward % 4 === 1 || toward % 4 === 2
-    const box = {
-      x: fromLeft ? region.x : region.x + region.w - w,
-      y: region.y,
-      w,
-      h: region.h,
-    }
-    const restW = region.w - w - gutter
-    if (restW < 8) return null
-    const rest = {
-      x: fromLeft ? region.x + w + gutter : region.x,
-      y: region.y,
-      w: restW,
-      h: region.h,
-    }
-    return { box, rest }
-  }
-  return toward % 2 === 1 ? (tryW() ?? tryH()) : (tryH() ?? tryW())
-}
-
 function bandCut(
   photo: Photo,
   region: Rect,
