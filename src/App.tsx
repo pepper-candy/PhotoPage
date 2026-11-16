@@ -2,8 +2,17 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import CropEditor from './CropEditor.tsx'
 import PagePreview from './PagePreview.tsx'
 import PhotoTray from './PhotoTray.tsx'
+import { EXPORT_SIZES, exportPackedPage, type ExportSizeId } from './exportPage.ts'
 import { pack } from './packer.ts'
-import { DEFAULT_GUTTER, pageSize, type Photo, type PhotoGroup, type Rect } from './types.ts'
+import {
+  DEFAULT_GUTTER,
+  DEFAULT_LAYOUT,
+  pageSize,
+  type LayoutMode,
+  type Photo,
+  type PhotoGroup,
+  type Rect,
+} from './types.ts'
 import './App.css'
 
 const ACCEPT = 'image/jpeg,image/png,image/webp,image/gif,.jpg,.jpeg,.png,.webp,.gif'
@@ -17,6 +26,14 @@ const PRESETS = [
   { id: 'a4', label: 'A4 portrait', w: 1, h: 1.414 },
   { id: 'custom', label: 'Custom', w: 0, h: 0 },
 ] as const
+
+const LAYOUTS: { id: LayoutMode; label: string }[] = [
+  { id: 'top', label: 'Top' },
+  { id: 'bottom', label: 'Bottom' },
+  { id: 'scattered', label: 'Scattered' },
+  { id: 'ring', label: 'Ring' },
+  { id: 'center', label: 'Center' },
+]
 
 function isRaster(file: File): boolean {
   const type = file.type.toLowerCase()
@@ -77,6 +94,11 @@ function App() {
   const [customW, setCustomW] = useState(4)
   const [customH, setCustomH] = useState(5)
   const [gutter, setGutter] = useState(DEFAULT_GUTTER)
+  const [layout, setLayout] = useState<LayoutMode>(DEFAULT_LAYOUT)
+  const [includeAll, setIncludeAll] = useState(true)
+  const [exportSize, setExportSize] = useState<ExportSizeId>('original')
+  const [exportError, setExportError] = useState<string | null>(null)
+  const [exporting, setExporting] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
   const activePreset = PRESETS.find((item) => item.id === preset) ?? PRESETS[1]
@@ -87,8 +109,12 @@ function App() {
 
   const page = useMemo(() => pageSize(safeW, safeH), [safeW, safeH])
   const placements = useMemo(
-    () => pack(photos, page, { gutter, breakIndex }),
-    [photos, page, gutter, breakIndex],
+    () => pack(photos, page, { gutter, breakIndex, layout, includeAll }),
+    [photos, page, gutter, breakIndex, layout, includeAll],
+  )
+  const packedIds = useMemo(
+    () => new Set(placements.map((item) => item.photoId)),
+    [placements],
   )
   const focusCount = Math.min(breakIndex, photos.length)
   const selected = photos.find((photo) => photo.id === selectedId) ?? null
@@ -227,6 +253,20 @@ function App() {
         )}
 
         <label>
+          Layout
+          <select
+            value={layout}
+            onChange={(event) => setLayout(event.target.value as LayoutMode)}
+          >
+            {LAYOUTS.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
           Gutter
           <input
             type="number"
@@ -236,6 +276,39 @@ function App() {
             onChange={(event) => setGutter(Math.max(0, Number(event.target.value) || 0))}
           />
         </label>
+
+        <span className="export-ctrl">
+          <select
+            value={exportSize}
+            aria-label="Export size"
+            onChange={(event) => {
+              setExportSize(event.target.value as ExportSizeId)
+              setExportError(null)
+            }}
+          >
+            {EXPORT_SIZES.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            disabled={exporting || placements.length === 0}
+            onClick={() => {
+              setExportError(null)
+              setExporting(true)
+              void exportPackedPage(page, photos, placements, exportSize, focusCount)
+                .catch((error: unknown) => {
+                  setExportError(error instanceof Error ? error.message : 'Export failed.')
+                })
+                .finally(() => setExporting(false))
+            }}
+          >
+            {exporting ? 'Exporting…' : 'Export'}
+          </button>
+        </span>
+        {exportError ? <span className="export-error">{exportError}</span> : null}
 
         <button type="button" onClick={clearAll}>
           Clear
@@ -254,6 +327,9 @@ function App() {
           onMoveToSection={moveToSection}
           onMoveToNicheStart={moveToNicheStart}
           onBreakIndex={(index) => commit(photos, index)}
+          includeAll={includeAll}
+          onIncludeAll={setIncludeAll}
+          packedIds={packedIds}
         />
         <div className={selected ? 'stage editing' : 'stage preview'}>
           {selected ? (

@@ -23,6 +23,7 @@ function CroppedPhoto({
   onSelect: () => void
 }) {
   const { x, y, w, h, sx, sy, sw, sh } = placement
+  const scale = Math.min(w / Math.max(sw, 0.001), h / Math.max(sh, 0.001))
   return (
     <button
       type="button"
@@ -44,10 +45,10 @@ function CroppedPhoto({
         alt={photo.name}
         draggable={false}
         style={{
-          width: `${(photo.width / sw) * 100}%`,
-          height: `${(photo.height / sh) * 100}%`,
-          left: `${(-sx / sw) * 100}%`,
-          top: `${(-sy / sh) * 100}%`,
+          width: `${((photo.width * scale) / w) * 100}%`,
+          height: `${((photo.height * scale) / h) * 100}%`,
+          left: `${((-sx * scale) / w) * 100}%`,
+          top: `${((-sy * scale) / h) * 100}%`,
         }}
       />
     </button>

@@ -51,16 +51,26 @@ export function sourceRectForAspect(photo: Photo, aspect: number): Rect {
     h *= scale
   }
 
-  if (w > W) {
-    w = W
-    h = w / a
+  if (w > W + EPS || h > H + EPS) {
+    const fit = Math.min(W / w, H / h)
+    w *= fit
+    h *= fit
   }
-  if (h > H) {
-    h = H
+  if (W / H >= a) {
+    h = Math.min(h, H)
     w = h * a
+    if (w > W) {
+      w = W
+      h = w / a
+    }
+  } else {
+    w = Math.min(w, W)
+    h = w / a
+    if (h > H) {
+      h = H
+      w = h * a
+    }
   }
-  w = Math.min(w, W)
-  h = Math.min(h, H)
 
   const minX = Math.max(0, S.x + S.w - w)
   const maxX = Math.min(W - w, S.x)

@@ -10,6 +10,14 @@ type Props = {
   onMoveToSection: (from: number, section: 'focus' | 'niche') => void
   onMoveToNicheStart: (from: number) => void
   onBreakIndex: (index: number) => void
+  includeAll: boolean
+  onIncludeAll: (value: boolean) => void
+  packedIds: Set<string>
+}
+
+type InsertPreview = {
+  index: number
+  top: number | null
 }
 
 function isFileDrag(event: DragEvent): boolean {
@@ -25,12 +33,16 @@ export default function PhotoTray({
   onMoveToSection,
   onMoveToNicheStart,
   onBreakIndex,
+  includeAll,
+  onIncludeAll,
+  packedIds,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null)
   const dragIndex = useRef<number | null>(null)
   const skipClick = useRef(false)
   const breakRef = useRef(breakIndex)
   const [overKey, setOverKey] = useState<string | null>(null)
+  const [insert, setInsert] = useState<InsertPreview | null>(null)
   breakRef.current = breakIndex
 
   function indexFromPointer(clientY: number): number {
@@ -45,22 +57,56 @@ export default function PhotoTray({
     return count
   }
 
+  function insertTop(index: number): number | null {
+    const root = listRef.current
+    if (!root || index === breakRef.current) return null
+    const rootRect = root.getBoundingClientRect()
+    const target = root.querySelector<HTMLElement>(`[data-photo-index="${index}"]`)
+    if (target) {
+      const rect = target.getBoundingClientRect()
+      return rect.top - rootRect.top + root.scrollTop
+    }
+    const nodes = root.querySelectorAll<HTMLElement>('[data-photo-index]')
+    const last = nodes[nodes.length - 1]
+    if (!last) return null
+    const rect = last.getBoundingClientRect()
+    return rect.bottom - rootRect.top + root.scrollTop + 4
+  }
+
+  function previewAt(clientY: number): InsertPreview {
+    const index = indexFromPointer(clientY)
+    return { index, top: insertTop(index) }
+  }
+
   function onBreakPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
     event.preventDefault()
     event.stopPropagation()
+    const handle = event.currentTarget
+    setInsert({ index: breakRef.current, top: null })
     const move = (ev: PointerEvent) => {
-      const next = indexFromPointer(ev.clientY)
-      if (next !== breakRef.current) {
-        breakRef.current = next
-        onBreakIndex(next)
-      }
+      const next = previewAt(ev.clientY)
+      setInsert((prev) =>
+        prev && prev.index === next.index && prev.top === next.top ? prev : next,
+      )
     }
-    const up = () => {
+    const up = (ev: PointerEvent) => {
+      const next = indexFromPointer(ev.clientY)
+      setInsert(null)
+      if (next !== breakRef.current) onBreakIndex(next)
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
+      if (handle.hasPointerCapture(ev.pointerId)) handle.releasePointerCapture(ev.pointerId)
+    }
+    try {
+      handle.setPointerCapture(event.pointerId)
+    } catch {
+      /* capture is optional; window listeners still track the drag */
     }
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
   }
 
   function allowMove(event: DragEvent) {
@@ -78,6 +124,7 @@ export default function PhotoTray({
 
   const focus = photos.slice(0, breakIndex)
   const niche = photos.slice(breakIndex)
+  const placing = insert != null
 
   function renderPhoto(photo: Photo, index: number) {
     const over = overKey === `before:${photo.id}` || overKey === `after:${photo.id}`
@@ -85,7 +132,7 @@ export default function PhotoTray({
       <div
         key={photo.id}
         data-photo-index={index}
-        className={`seq-item${selectedId === photo.id ? ' selected' : ''}${over ? ' over' : ''}`}
+        className={`seq-item${selectedId === photo.id ? ' selected' : ''}${over ? ' over' : ''}${packedIds.has(photo.id) ? '' : ' unused'}`}
         draggable
         onPointerDown={() => {
           skipClick.current = false
@@ -133,7 +180,11 @@ export default function PhotoTray({
   }
 
   return (
-    <div className="sequence" ref={listRef} aria-label="Photo sequence">
+    <div
+      className={`sequence${placing ? ' placing-break' : ''}`}
+      ref={listRef}
+      aria-label="Photo sequence"
+    >
       <div className="section-label">Focus</div>
       {focus.length === 0 ? (
         <div
@@ -158,7 +209,7 @@ export default function PhotoTray({
       )}
 
       <div
-        className="break-handle"
+        className={`break-handle${placing ? ' dragging' : ''}${placing && insert.index === breakIndex ? ' insert-here' : ''}`}
         onPointerDown={onBreakPointerDown}
         onDragOver={allowMove}
         onDrop={(event) => {
@@ -178,7 +229,21 @@ export default function PhotoTray({
         <span className="break-note">Focus above · niche below</span>
       </div>
 
-      <div className="section-label">Niche</div>
+      <div className="section-row">
+        <div className="section-label">Niche</div>
+        <label
+          className="inc-all"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <input
+            type="checkbox"
+            checked={includeAll}
+            onChange={(event) => onIncludeAll(event.target.checked)}
+          />
+          Include all
+        </label>
+      </div>
       {niche.map((photo, index) => renderPhoto(photo, breakIndex + index))}
       <div
         className={`drop-tail${overKey === 'end' ? ' over' : ''}`}
@@ -194,6 +259,11 @@ export default function PhotoTray({
           onMoveToSection(from, 'niche')
         }}
       />
+      {insert?.top != null ? (
+        <div className="break-insert" style={{ top: insert.top }} aria-hidden>
+          <span className="break-insert-bar" />
+        </div>
+      ) : null}
     </div>
   )
 }

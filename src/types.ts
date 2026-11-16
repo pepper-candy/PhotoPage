@@ -1,4 +1,5 @@
 export type PhotoGroup = 'focus' | 'niche'
+export type LayoutMode = 'top' | 'bottom' | 'scattered' | 'ring' | 'center'
 
 export type Rect = {
   x: number
@@ -25,6 +26,8 @@ export type Page = {
 export type PackOptions = {
   gutter: number
   breakIndex: number
+  layout: LayoutMode
+  includeAll: boolean
 }
 
 export type Placement = {
@@ -43,6 +46,7 @@ export const PAGE_WIDTH = 1000
 export const FOCUS_MAX_CROP = 0.1
 export const NICHE_MAX_CROP = 0.5
 export const DEFAULT_GUTTER = 2
+export const DEFAULT_LAYOUT: LayoutMode = 'top'
 
 export function pageSize(aspectW: number, aspectH: number): Page {
   return { width: PAGE_WIDTH, height: PAGE_WIDTH * (aspectH / aspectW) }
