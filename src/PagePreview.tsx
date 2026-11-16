@@ -9,7 +9,7 @@ import {
   type ReactElement,
 } from 'react'
 import { adaptSource, canPan, panSource, zoomSource } from './crop.ts'
-import { fillSpareHole, spareHoles } from './packer.ts'
+import { spareHoles } from './packer.ts'
 import { findCuts, nudgeCut, type Cut } from './seams.ts'
 import type { Page, Photo, Placement, Rect } from './types.ts'
 
@@ -24,7 +24,8 @@ type Props = {
   onPlacements?: (next: Placement[]) => void
   gutter?: number
   packing?: boolean
-  onBusy?: (work: () => void) => void
+  onFillHole?: (hole: Rect) => void
+  boundless?: boolean
   spares?: Photo[]
   modifying?: boolean
   starring?: boolean
@@ -392,7 +393,8 @@ export default function PagePreview({
   onPlacements,
   gutter = 0,
   packing = false,
-  onBusy,
+  onFillHole,
+  boundless = false,
   spares = [],
   modifying = false,
   starring = false,
@@ -519,7 +521,7 @@ export default function PagePreview({
   return (
     <div
       ref={pageRef}
-      className={`page${action ? ` ${action === 'delete' ? 'modifying' : 'starring'}` : ''}${swapFrom ? ' swapping' : ''}`}
+      className={`page${boundless ? ' boundless' : ''}${action ? ` ${action === 'delete' ? 'modifying' : 'starring'}` : ''}${swapFrom ? ' swapping' : ''}`}
       style={
         {
           '--pw': page.width,
@@ -597,13 +599,8 @@ export default function PagePreview({
           }}
           onClick={(event) => {
             event.stopPropagation()
-            if (!onPlacements || packing) return
-            const work = () => {
-              const next = fillSpareHole(placementsRef.current, photos, page, gutter, hole)
-              if (next.length > placementsRef.current.length) onPlacements(next)
-            }
-            if (onBusy) onBusy(work)
-            else work()
+            if (!onFillHole || packing) return
+            onFillHole(hole)
           }}
         >
           <span className="gap-fill-plus" aria-hidden>

@@ -63,7 +63,7 @@ function tooLarge(id: ExportSizeId): Error {
   return new Error(`Could not export ${sizeLabel(id)}: the image is too large for this browser.`)
 }
 
-function makeCanvas(width: number, height: number, id: ExportSizeId): HTMLCanvasElement {
+function makeCanvas(width: number, height: number, id: ExportSizeId, alpha: boolean): HTMLCanvasElement {
   const w = Math.ceil(width)
   const h = Math.ceil(height)
   if (!Number.isFinite(w) || !Number.isFinite(h) || w < 1 || h < 1) {
@@ -77,11 +77,14 @@ function makeCanvas(width: number, height: number, id: ExportSizeId): HTMLCanvas
     throw tooLarge(id)
   }
   if (canvas.width !== w || canvas.height !== h) throw tooLarge(id)
-  const ctx = canvas.getContext('2d', { alpha: false })
+  const ctx = canvas.getContext('2d', { alpha })
   if (!ctx) throw tooLarge(id)
   try {
-    ctx.fillStyle = PAGE_FILL
-    ctx.fillRect(0, 0, 1, 1)
+    if (alpha) ctx.clearRect(0, 0, 1, 1)
+    else {
+      ctx.fillStyle = PAGE_FILL
+      ctx.fillRect(0, 0, 1, 1)
+    }
     const probe = ctx.getImageData(0, 0, 1, 1)
     if (!probe || probe.data.length < 4) throw tooLarge(id)
   } catch (error) {
@@ -100,6 +103,21 @@ function loadImage(url: string): Promise<HTMLImageElement> {
   })
 }
 
+function contentPage(placements: Placement[], fallback: Page): Page {
+  let x0 = Infinity
+  let y0 = Infinity
+  let x1 = -Infinity
+  let y1 = -Infinity
+  for (const item of placements) {
+    x0 = Math.min(x0, item.x)
+    y0 = Math.min(y0, item.y)
+    x1 = Math.max(x1, item.x + item.w)
+    y1 = Math.max(y1, item.y + item.h)
+  }
+  if (!Number.isFinite(x0)) return fallback
+  return { width: Math.max(1, x1 - x0), height: Math.max(1, y1 - y0) }
+}
+
 function drawPhoto(
   ctx: CanvasRenderingContext2D,
   img: HTMLImageElement,
@@ -107,9 +125,11 @@ function drawPhoto(
   item: Placement,
   scaleX: number,
   scaleY: number,
+  originX = 0,
+  originY = 0,
 ) {
-  const cellX = item.x * scaleX
-  const cellY = item.y * scaleY
+  const cellX = (item.x - originX) * scaleX
+  const cellY = (item.y - originY) * scaleY
   const cellW = item.w * scaleX
   const cellH = item.h * scaleY
   const sx = Math.max(0, Math.min(item.sx, photo.width - 1))
@@ -128,19 +148,37 @@ export async function exportPackedPage(
   placements: Placement[],
   sizeId: ExportSizeId,
   breakIndex: number,
+  options?: { transparent?: boolean },
 ): Promise<void> {
   if (placements.length === 0) {
     throw new Error('Nothing to export.')
   }
-  const { width, height } = exportPixelSize(page, placements, photos, sizeId, breakIndex)
-  const canvas = makeCanvas(width, height, sizeId)
-  const ctx = canvas.getContext('2d', { alpha: false })
+  const transparent = options?.transparent === true
+  let originX = 0
+  let originY = 0
+  let exportPage = page
+  if (transparent) {
+    let x0 = Infinity
+    let y0 = Infinity
+    for (const item of placements) {
+      x0 = Math.min(x0, item.x)
+      y0 = Math.min(y0, item.y)
+    }
+    originX = Number.isFinite(x0) ? x0 : 0
+    originY = Number.isFinite(y0) ? y0 : 0
+    exportPage = contentPage(placements, page)
+  }
+  const { width, height } = exportPixelSize(exportPage, placements, photos, sizeId, breakIndex)
+  const canvas = makeCanvas(width, height, sizeId, transparent)
+  const ctx = canvas.getContext('2d', { alpha: transparent })
   if (!ctx) throw tooLarge(sizeId)
 
   ctx.imageSmoothingEnabled = true
   ctx.imageSmoothingQuality = 'high'
-  ctx.fillStyle = PAGE_FILL
-  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  if (!transparent) {
+    ctx.fillStyle = PAGE_FILL
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+  }
 
   const byId = new Map(photos.map((photo) => [photo.id, photo]))
   const needed = [...new Set(placements.map((item) => item.photoId))]
@@ -161,13 +199,13 @@ export async function exportPackedPage(
     }),
   )
 
-  const scaleX = canvas.width / page.width
-  const scaleY = canvas.height / page.height
+  const scaleX = canvas.width / exportPage.width
+  const scaleY = canvas.height / exportPage.height
   for (const item of placements) {
     const photo = byId.get(item.photoId)
     const img = images.get(item.photoId)
     if (!photo || !img) continue
-    drawPhoto(ctx, img, photo, item, scaleX, scaleY)
+    drawPhoto(ctx, img, photo, item, scaleX, scaleY, originX, originY)
   }
 
   const blob = await new Promise<Blob>((resolve, reject) => {

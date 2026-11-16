@@ -1,10 +1,24 @@
 import { clamp, legalAspectRange, preferredAspect, sourceRectForAspect } from './crop.ts'
-import type { LayoutMode, PackOptions, Page, Photo, PhotoGroup, Placement, Rect } from './types.ts'
+import {
+  PAGE_WIDTH,
+  type LayoutMode,
+  type PackOptions,
+  type Page,
+  type Photo,
+  type PhotoGroup,
+  type Placement,
+  type Rect,
+} from './types.ts'
 
 const EPS = 0.6
 const FOCUS_ROW_SCALE = 2.2
 const FOCUS_MIN_RATIO = 1.5
 const GAP_PASSES = 5
+const LAND_ASPECT = 4 / 3
+const PORT_ASPECT = 3 / 4
+const PHOTO_ASPECT_MIN = 0.45
+const PHOTO_ASPECT_MAX = 2.2
+const SLOT_ALIGNS = [0, 0.25, 0.5, 0.75, 1]
 
 function cellArea(rect: { w: number; h: number }): number {
   return Math.max(0, rect.w) * Math.max(0, rect.h)
@@ -2274,6 +2288,491 @@ function finish(placed: Placement[]): Placement[] {
   )
 }
 
+function isWideAspect(aspect: number): boolean {
+  return aspect >= 1
+}
+
+function targetCellAspect(photo: Photo): number {
+  const { min, max } = legalAspectRange(photo)
+  const pref = preferredAspect(photo)
+  const want = pref >= 1 ? LAND_ASPECT : PORT_ASPECT
+  if (want >= min - 1e-4 && want <= max + 1e-4) return want
+  return pref
+}
+
+function sizedForShort(photo: Photo, shortSide: number): { w: number; h: number } {
+  const a = Math.max(1e-4, targetCellAspect(photo))
+  if (a >= 1) {
+    const h = Math.max(8, shortSide)
+    return { w: h * a, h }
+  }
+  const w = Math.max(8, shortSide)
+  return { w, h: w / a }
+}
+
+function boundsOf(items: { x: number; y: number; w: number; h: number }[]): Rect {
+  let x0 = Infinity
+  let y0 = Infinity
+  let x1 = -Infinity
+  let y1 = -Infinity
+  for (const item of items) {
+    x0 = Math.min(x0, item.x)
+    y0 = Math.min(y0, item.y)
+    x1 = Math.max(x1, item.x + item.w)
+    y1 = Math.max(y1, item.y + item.h)
+  }
+  if (!Number.isFinite(x0)) return { x: 0, y: 0, w: 1, h: 1 }
+  return { x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) }
+}
+
+function centroidOf(items: Placement[]): { x: number; y: number } {
+  if (items.length === 0) return { x: 0, y: 0 }
+  let sx = 0
+  let sy = 0
+  let area = 0
+  for (const item of items) {
+    const weight = cellArea(item)
+    sx += (item.x + item.w / 2) * weight
+    sy += (item.y + item.h / 2) * weight
+    area += weight
+  }
+  if (area < EPS) {
+    return { x: items[0].x + items[0].w / 2, y: items[0].y + items[0].h / 2 }
+  }
+  return { x: sx / area, y: sy / area }
+}
+
+function shiftPlacements(items: Placement[], dx: number, dy: number): Placement[] {
+  if (Math.abs(dx) < EPS && Math.abs(dy) < EPS) return items
+  return items.map((item) => ({ ...item, x: item.x + dx, y: item.y + dy }))
+}
+
+function normalizePlacements(items: Placement[]): Placement[] {
+  if (items.length === 0) return items
+  const box = boundsOf(items)
+  return shiftPlacements(items, -box.x, -box.y)
+}
+
+function collide(box: Rect, others: Placement[], gutter: number): boolean {
+  for (const other of others) {
+    if (boxesOverlap(box, other, gutter)) return true
+  }
+  return false
+}
+
+function attachBox(neighbor: Placement, side: Dir, w: number, h: number, gutter: number, t: number): Rect {
+  const g = Math.max(0, gutter)
+  const along = clamp(t, 0, 1)
+  if (side === 'right') {
+    const span = Math.max(0, neighbor.h - h)
+    return { x: neighbor.x + neighbor.w + g, y: neighbor.y + span * along, w, h }
+  }
+  if (side === 'left') {
+    const span = Math.max(0, neighbor.h - h)
+    return { x: neighbor.x - g - w, y: neighbor.y + span * along, w, h }
+  }
+  if (side === 'down') {
+    const span = Math.max(0, neighbor.w - w)
+    return { x: neighbor.x + span * along, y: neighbor.y + neighbor.h + g, w, h }
+  }
+  const span = Math.max(0, neighbor.w - w)
+  return { x: neighbor.x + span * along, y: neighbor.y - g - h, w, h }
+}
+
+function sizeAgainstEdge(
+  photo: Photo,
+  neighbor: Placement,
+  side: Dir,
+  shortSide: number,
+  maxArea: number,
+): { w: number; h: number } {
+  const a = targetCellAspect(photo)
+  const { min, max } = legalAspectRange(photo)
+  const natural = sizedForShort(photo, shortSide)
+  const edge = side === 'left' || side === 'right' ? neighbor.h : neighbor.w
+  let w: number
+  let h: number
+  if (side === 'left' || side === 'right') {
+    h = edge
+    w = h * clamp(a, min, max)
+  } else {
+    w = edge
+    h = w / clamp(a, min, max)
+  }
+  const area = w * h
+  const natArea = natural.w * natural.h
+  if (Number.isFinite(maxArea) && area > maxArea + EPS) {
+    const scale = Math.sqrt(maxArea / Math.max(area, 0.001))
+    w *= scale
+    h *= scale
+  }
+  if (area > natArea * 2.2) {
+    const scale = Math.sqrt((natArea * 2.2) / Math.max(area, 0.001))
+    w *= scale
+    h *= scale
+  }
+  if (Math.min(w, h) < shortSide * 0.45) {
+    w = natural.w
+    h = natural.h
+  }
+  return { w: Math.max(8, w), h: Math.max(8, h) }
+}
+
+type BoundlessSlot = {
+  box: Rect
+  neighbor: Placement
+  side: Dir
+  opposite: boolean
+}
+
+function collectEdgeSlots(
+  photo: Photo,
+  placed: Placement[],
+  gutter: number,
+  shortSide: number,
+  maxArea: number,
+): BoundlessSlot[] {
+  const slots: BoundlessSlot[] = []
+  const photoWide = isWideAspect(targetCellAspect(photo))
+  for (const neighbor of placed) {
+    const neighWide = isWideAspect(neighbor.w / Math.max(neighbor.h, 0.001))
+    const opposite = photoWide !== neighWide
+    for (const side of ['right', 'left', 'down', 'up'] as Dir[]) {
+      const { w, h } = sizeAgainstEdge(photo, neighbor, side, shortSide, maxArea)
+      for (const t of SLOT_ALIGNS) {
+        const box = attachBox(neighbor, side, w, h, gutter, t)
+        if (collide(box, placed, gutter)) continue
+        slots.push({ box, neighbor, side, opposite })
+      }
+    }
+  }
+  return slots
+}
+
+function touchingCount(hole: Rect, placed: Placement[], gutter: number): number {
+  let count = 0
+  for (const item of placed) {
+    if (edgeSide(item, hole, gutter)) count += 1
+  }
+  return count
+}
+
+function touchingDirs(hole: Rect, placed: Placement[], gutter: number): Dir[] {
+  const dirs: Dir[] = []
+  for (const item of placed) {
+    const side = edgeSide(item, hole, gutter)
+    if (side) dirs.push(side)
+  }
+  return dirs
+}
+
+function holeTouchesBounds(hole: Rect, box: Rect): boolean {
+  return (
+    hole.x <= box.x + EPS ||
+    hole.y <= box.y + EPS ||
+    hole.x + hole.w >= box.x + box.w - EPS ||
+    hole.y + hole.h >= box.y + box.h - EPS
+  )
+}
+
+function typicalCellArea(placements: Placement[]): number {
+  const areas = placements.map(cellArea).sort((a, b) => a - b)
+  if (areas.length === 0) return 0
+  const small = areas.slice(0, Math.max(1, Math.ceil(areas.length * 0.65)))
+  return small[Math.floor(small.length / 2)] ?? 0
+}
+
+function photoShapedPocket(
+  hole: Rect,
+  placed: Placement[],
+  gutter: number,
+  typical: number,
+  box: Rect,
+): boolean {
+  const aspect = hole.w / Math.max(hole.h, 0.001)
+  if (aspect < PHOTO_ASPECT_MIN || aspect > PHOTO_ASPECT_MAX) return false
+  const minSide = Math.min(hole.w, hole.h)
+  const minOk = Math.max(gutter + 16, typical > 0 ? Math.sqrt(typical) * 0.45 : 40)
+  if (minSide < minOk) return false
+  if (typical > 0 && cellArea(hole) < typical * 0.35) return false
+  const dirs = [...new Set(touchingDirs(hole, placed, gutter))]
+  if (dirs.length < 2) return false
+  const opposite =
+    (dirs.includes('left') && dirs.includes('right')) || (dirs.includes('up') && dirs.includes('down'))
+  if (opposite || dirs.length >= 3) return true
+  if (holeTouchesBounds(hole, box) && dirs.length <= 2) return false
+  return touchingCount(hole, placed, gutter) >= 2
+}
+
+function corridorSlots(
+  photo: Photo,
+  placed: Placement[],
+  gutter: number,
+  shortSide: number,
+  maxArea: number,
+): BoundlessSlot[] {
+  const cluster = boundsOf(placed)
+  const pad = Math.max(shortSide * 2, 80)
+  const region: Rect = {
+    x: cluster.x - pad,
+    y: cluster.y - pad,
+    w: cluster.w + pad * 2,
+    h: cluster.h + pad * 2,
+  }
+  const natural = sizedForShort(photo, shortSide)
+  const photoWide = isWideAspect(targetCellAspect(photo))
+  const slots: BoundlessSlot[] = []
+  for (const hole of leftoverHoles(region, placed, gutter)) {
+    if (hole.w < natural.w * 0.45 || hole.h < natural.h * 0.45) continue
+    if (touchingCount(hole, placed, gutter) < 2) continue
+    const fitted = legalBox(photo, {
+      x: hole.x,
+      y: hole.y,
+      w: Math.min(hole.w, natural.w * 1.45),
+      h: Math.min(hole.h, natural.h * 1.45),
+    })
+    if (Number.isFinite(maxArea) && cellArea(fitted) > maxArea) {
+      const scale = Math.sqrt(maxArea / Math.max(cellArea(fitted), 0.001))
+      fitted.w *= scale
+      fitted.h *= scale
+    }
+    if (collide(fitted, placed, gutter)) continue
+    let neighbor = placed[0]
+    let best = Number.POSITIVE_INFINITY
+    for (const item of placed) {
+      const d =
+        Math.abs(item.x + item.w / 2 - (fitted.x + fitted.w / 2)) +
+        Math.abs(item.y + item.h / 2 - (fitted.y + fitted.h / 2))
+      if (d < best) {
+        best = d
+        neighbor = item
+      }
+    }
+    const neighWide = isWideAspect(neighbor.w / Math.max(neighbor.h, 0.001))
+    slots.push({
+      box: fitted,
+      neighbor,
+      side: 'down',
+      opposite: photoWide !== neighWide,
+    })
+  }
+  return slots
+}
+
+function scoreSlot(
+  slot: BoundlessSlot,
+  photo: Photo,
+  placed: Placement[],
+  focusIds: Set<string>,
+  hintAspect: number,
+  shortSide: number,
+): number {
+  const focusPlaced = placed.filter((item) => focusIds.has(item.photoId))
+  const origin = focusPlaced.length > 0 ? centroidOf(focusPlaced) : centroidOf(placed)
+  const cx = slot.box.x + slot.box.w / 2
+  const cy = slot.box.y + slot.box.h / 2
+  const dist = Math.hypot(cx - origin.x, cy - origin.y)
+  const probe: Placement = {
+    photoId: photo.id,
+    x: slot.box.x,
+    y: slot.box.y,
+    w: slot.box.w,
+    h: slot.box.h,
+    sx: 0,
+    sy: 0,
+    sw: 1,
+    sh: 1,
+  }
+  const next = [...placed, probe]
+  const box = boundsOf(next)
+  const grown = box.w / Math.max(box.h, 0.001)
+  const hintPenalty = Math.abs(Math.log(grown / Math.max(hintAspect, 0.001)))
+  const recenter = Math.hypot(centroidOf(next).x - origin.x, centroidOf(next).y - origin.y)
+  let score = slot.opposite ? 0 : shortSide * 3.2
+  score += dist * 0.35
+  score += hintPenalty * shortSide * 1.8
+  score += recenter * 0.25
+  return score
+}
+
+function pickSlot(
+  photo: Photo,
+  placed: Placement[],
+  gutter: number,
+  shortSide: number,
+  maxArea: number,
+  focusIds: Set<string>,
+  hintAspect: number,
+  relax: boolean,
+): BoundlessSlot | null {
+  let slots = collectEdgeSlots(photo, placed, gutter, shortSide, maxArea)
+  if (!relax) {
+    const opposite = slots.filter((slot) => slot.opposite)
+    if (opposite.length > 0) slots = opposite
+  }
+  if (slots.length === 0) slots = corridorSlots(photo, placed, gutter, shortSide, maxArea)
+  if (slots.length === 0 && relax) {
+    slots = collectEdgeSlots(photo, placed, gutter, shortSide, maxArea)
+  }
+  if (slots.length === 0) return null
+  let best = slots[0]
+  let bestScore = scoreSlot(best, photo, placed, focusIds, hintAspect, shortSide)
+  for (let i = 1; i < slots.length; i++) {
+    const score = scoreSlot(slots[i], photo, placed, focusIds, hintAspect, shortSide)
+    if (score < bestScore) {
+      best = slots[i]
+      bestScore = score
+    }
+  }
+  return best
+}
+
+function attachPhotos(
+  photos: Photo[],
+  seed: Placement[],
+  gutter: number,
+  shortSide: number,
+  maxArea: number,
+  focusIds: Set<string>,
+  hintAspect: number,
+): Placement[] {
+  let placed = seed.slice()
+  const tryOne = (photo: Photo, relax: boolean): boolean => {
+    const slot = pickSlot(photo, placed, gutter, shortSide, maxArea, focusIds, hintAspect, relax)
+    if (!slot) return false
+    placed.push(fillCell(photo, slot.box))
+    return true
+  }
+  let remaining = photos.filter((photo) => !tryOne(photo, false))
+  remaining = remaining.filter((photo) => !tryOne(photo, true))
+  return placed
+}
+
+function packFocusKernel(focus: Photo[], gutter: number, hintAspect: number): Placement[] {
+  if (focus.length === 0) return []
+  const short = PAGE_WIDTH * 0.26
+  const size = sizedForShort(focus[0], short)
+  let placed = [fillCell(focus[0], { x: 0, y: 0, w: size.w, h: size.h })]
+  const ids = new Set(focus.map((photo) => photo.id))
+  const cap = cellArea(placed[0]) * 1.35
+  placed = attachPhotos(focus.slice(1), placed, gutter, short, cap, ids, hintAspect)
+  const center = centroidOf(placed)
+  return shiftPlacements(placed, -center.x, -center.y)
+}
+
+function fillOnePocket(photo: Photo, hole: Rect, maxArea: number): Placement | null {
+  const box = fitsAspect(photo, hole.w, hole.h) ? { ...hole } : legalBox(photo, hole)
+  if (box.w < hole.w * 0.5 || box.h < hole.h * 0.5) return null
+  if (Number.isFinite(maxArea) && cellArea(box) > maxArea * 1.2) {
+    const scale = Math.sqrt((maxArea * 1.2) / Math.max(cellArea(box), 0.001))
+    box.w *= scale
+    box.h *= scale
+  }
+  const aspect = box.w / Math.max(box.h, 0.001)
+  if (aspect < PHOTO_ASPECT_MIN || aspect > PHOTO_ASPECT_MAX) return null
+  box.x = hole.x + Math.max(0, (hole.w - box.w) / 2)
+  box.y = hole.y + Math.max(0, (hole.h - box.h) / 2)
+  return fillCell(photo, box)
+}
+
+function fillPhotoPockets(
+  placed: Placement[],
+  leftover: Photo[],
+  gutter: number,
+  maxArea: number,
+): Placement[] {
+  let remaining = leftover.slice()
+  let out = placed.slice()
+  for (let pass = 0; pass < 24 && remaining.length > 0; pass++) {
+    const box = boundsOf(out)
+    const typical = typicalCellArea(out)
+    const holes = leftoverHoles(box, out, gutter)
+      .filter((hole) => photoShapedPocket(hole, out, gutter, typical, box))
+      .sort((a, b) => cellArea(b) - cellArea(a))
+    if (holes.length === 0) break
+    let progressed = false
+    for (const hole of holes) {
+      const holeAspect = hole.w / Math.max(hole.h, 0.001)
+      const ranked = remaining
+        .map((photo) => ({ photo, d: Math.abs(Math.log(targetCellAspect(photo) / holeAspect)) }))
+        .sort((a, b) => a.d - b.d)
+      for (const entry of ranked) {
+        const extra = fillOnePocket(entry.photo, hole, maxArea)
+        if (!extra || collide(extra, out, gutter)) continue
+        out = [...out, extra]
+        remaining = remaining.filter((photo) => photo.id !== extra.photoId)
+        progressed = true
+        break
+      }
+      if (progressed) break
+    }
+    if (!progressed) break
+  }
+  return out
+}
+
+function packBoundless(
+  focus: Photo[],
+  niche: Photo[],
+  gutter: number,
+  tagged: Photo[],
+  includeAll: boolean,
+  page: Page,
+): Placement[] {
+  const hintAspect =
+    page.width >= 1 && page.height >= 1 ? page.width / page.height : LAND_ASPECT
+  const g = Math.max(0, gutter)
+  const focusIds = new Set(focus.map((photo) => photo.id))
+
+  let placed: Placement[]
+  let pool: Photo[]
+  if (focus.length > 0) {
+    placed = packFocusKernel(focus, g, hintAspect)
+    pool = niche.slice()
+  } else if (niche.length > 0) {
+    const short = PAGE_WIDTH * 0.16
+    const size = sizedForShort(niche[0], short)
+    placed = [fillCell(niche[0], { x: 0, y: 0, w: size.w, h: size.h })]
+    pool = niche.slice(1)
+  } else {
+    return []
+  }
+
+  const focusPlaced = placed.filter((item) => focusIds.has(item.photoId))
+  const cap = focusPlaced.length > 0 ? nicheAreaCap(focusPlaced) : Number.POSITIVE_INFINITY
+  const focusShort =
+    focusPlaced.length > 0
+      ? Math.min(...focusPlaced.map((item) => Math.min(item.w, item.h)))
+      : PAGE_WIDTH * 0.16
+  const nicheShort = Math.max(24, Math.min(focusShort / Math.sqrt(FOCUS_MIN_RATIO), Math.sqrt(Math.max(cap, 1) / LAND_ASPECT)))
+  const attachIds = focusIds.size > 0 ? focusIds : new Set(placed.map((item) => item.photoId))
+
+  if (!includeAll && pool.length > 4) {
+    const keep = Math.min(4, Math.max(0, Math.round(pool.length * 0.12)))
+    pool = pool.slice(0, Math.max(0, pool.length - keep))
+  }
+
+  placed = attachPhotos(pool, placed, g, nicheShort, cap, attachIds, hintAspect)
+
+  const used = new Set(placed.map((item) => item.photoId))
+  let leftover = tagged.filter((photo) => !used.has(photo.id) && (focusIds.size === 0 || !focusIds.has(photo.id)))
+  placed = fillPhotoPockets(placed, leftover, g, cap)
+
+  if (includeAll) {
+    leftover = tagged.filter((photo) => !placed.some((item) => item.photoId === photo.id))
+    if (leftover.length > 0) {
+      placed = attachPhotos(leftover, placed, g, nicheShort, cap, attachIds, hintAspect)
+    }
+    leftover = tagged.filter((photo) => !placed.some((item) => item.photoId === photo.id))
+    for (const photo of leftover) {
+      const slot = pickSlot(photo, placed, g, nicheShort, cap, attachIds, hintAspect, true)
+      if (slot) placed.push(fillCell(photo, slot.box))
+    }
+  }
+
+  return normalizePlacements(placed)
+}
+
 export function pack(photos: Photo[], page: Page, options: PackOptions): Placement[] {
   coverMemo.clear()
   const gutter = Math.max(0, options.gutter)
@@ -2281,12 +2780,18 @@ export function pack(photos: Photo[], page: Page, options: PackOptions): Placeme
   const layout: LayoutMode = options.layout ?? 'center'
   const includeAll = options.includeAll !== false
   const tagged = tagGroups(photos, breakIndex)
-  if (tagged.length === 0 || page.width < 1 || page.height < 1) return []
+  if (tagged.length === 0) return []
+  if (layout !== 'boundless' && (page.width < 1 || page.height < 1)) return []
 
-  const full: Rect = { x: 0, y: 0, w: page.width, h: page.height }
   const breakAt = clamp(Math.trunc(breakIndex), 0, tagged.length)
   const focus = tagged.slice(0, breakAt)
   const niche = tagged.slice(breakAt)
+
+  if (layout === 'boundless') {
+    return finish(packBoundless(focus, niche, gutter, tagged, includeAll, page))
+  }
+
+  const full: Rect = { x: 0, y: 0, w: page.width, h: page.height }
 
   let placed: Placement[]
   if (focus.length === 0) {
@@ -2314,8 +2819,10 @@ export function spareHoles(page: Page, placements: Placement[], gutter: number):
   const g = Math.max(0, gutter)
   const minSide = Math.max(40, g + 16)
   const full: Rect = { x: 0, y: 0, w: page.width, h: page.height }
+  const typical = typicalCellArea(placements)
   return leftoverHoles(full, placements, g)
     .filter((hole) => hole.w >= minSide && hole.h >= minSide)
+    .filter((hole) => photoShapedPocket(hole, placements, g, typical, full))
     .sort((a, b) => b.w * b.h - a.w * a.h)
 }
 
@@ -2325,6 +2832,7 @@ export function fillSpareHole(
   page: Page,
   gutter: number,
   hole: Rect,
+  layout?: LayoutMode,
 ): Placement[] {
   const g = Math.max(0, gutter)
   const used = new Set(placements.map((item) => item.photoId))
@@ -2333,6 +2841,22 @@ export function fillSpareHole(
   const byId = new Map(photos.map((photo) => [photo.id, photo]))
   const focusPlaced = placements.filter((item) => byId.get(item.photoId)?.group === 'focus')
   const cap = nicheAreaCap(focusPlaced)
+  if (layout === 'boundless') {
+    const holeAspect = hole.w / Math.max(hole.h, 0.001)
+    const ranked = remaining
+      .slice()
+      .sort(
+        (a, b) =>
+          Math.abs(Math.log(targetCellAspect(a) / holeAspect)) -
+          Math.abs(Math.log(targetCellAspect(b) / holeAspect)),
+      )
+    for (const photo of ranked) {
+      const extra = fillOnePocket(photo, hole, cap)
+      if (!extra || collide(extra, placements, g)) continue
+      return finish(normalizePlacements([...placements, extra]))
+    }
+    return placements
+  }
   let extra = placeIntoHole(remaining, hole, g, false, cap)
   if (extra.length === 0) extra = placeIntoHole(remaining.slice(0, 1), hole, g, true, cap)
   if (extra.length === 0) return placements

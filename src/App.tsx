@@ -14,7 +14,7 @@ import CropEditor from './CropEditor.tsx'
 import PagePreview from './PagePreview.tsx'
 import PhotoTray from './PhotoTray.tsx'
 import { EXPORT_SIZES, exportPackedPage, type ExportSizeId } from './exportPage.ts'
-import { pack } from './packer.ts'
+import { fillSpareHole, pack } from './packer.ts'
 import PackWorker from './packWorker.ts?worker'
 import {
   DEFAULT_GUTTER,
@@ -51,6 +51,7 @@ const LAYOUTS: { id: LayoutMode; label: string }[] = [
   { id: 'bottom', label: 'Bottom' },
   { id: 'ring', label: 'Ring' },
   { id: 'center', label: 'Center' },
+  { id: 'boundless', label: 'Boundless' },
 ]
 
 const PREFS_KEY = 'photopage.user-prefs'
@@ -202,23 +203,31 @@ function App() {
   const safeW = aspectW > 0 ? aspectW : 1
   const safeH = aspectH > 0 ? aspectH : 1
 
-  const page = useMemo(() => pageSize(safeW, safeH), [safeW, safeH])
+  const hintPage = useMemo(() => pageSize(safeW, safeH), [safeW, safeH])
   const packedIds = useMemo(
     () => new Set(placements.map((item) => item.photoId)),
     [placements],
   )
+  const page = useMemo(() => {
+    if (layout !== 'boundless' || placements.length === 0) return hintPage
+    let width = 1
+    let height = 1
+    for (const item of placements) {
+      width = Math.max(width, item.x + item.w)
+      height = Math.max(height, item.y + item.h)
+    }
+    return { width, height }
+  }, [layout, placements, hintPage])
   const focusCount = Math.min(breakIndex, photos.length)
   const selected = photos.find((photo) => photo.id === selectedId) ?? null
   const packOptions = useMemo(
     () => ({ gutter, breakIndex, layout, includeAll }),
     [gutter, breakIndex, layout, includeAll],
   )
-  const packSig = `${photos.map((photo) => `${photo.id}:${photo.group}:${photo.safe.x}:${photo.safe.y}:${photo.safe.w}:${photo.safe.h}`).join(',')}|${page.width}x${page.height}|${gutter}|${layout}|${includeAll}|${breakIndex}`
-  const packSigRef = useRef(packSig)
-  if (packSig !== packSigRef.current) {
-    packSigRef.current = packSig
-    if (photos.length > 0 && !packing) setPacking(true)
-  }
+  const packSig = `${photos.map((photo) => `${photo.id}:${photo.group}:${photo.safe.x}:${photo.safe.y}:${photo.safe.w}:${photo.safe.h}`).join(',')}|${hintPage.width}x${hintPage.height}|${gutter}|${layout}|${includeAll}|${breakIndex}`
+  const packedSigRef = useRef('')
+  const cancelJob = useRef<(() => void) | null>(null)
+  const showSpin = photos.length > 0 && (packing || packSig !== packedSigRef.current)
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -232,37 +241,41 @@ function App() {
     saveUserPrefs({ preset, customW, customH, layout, gutter, exportSize })
   }, [preset, customW, customH, layout, gutter, exportSize])
 
-  useEffect(() => {
-    const id = ++packId.current
-    if (photos.length === 0) {
-      setPlacements([])
-      setPacking(false)
-      return
-    }
-    setPacking(true)
-    const job: PackJob = { id, photos, page, options: packOptions }
+  function runJob(job: PackJob) {
     let worker: Worker | undefined
+    const finish = (next: Placement[]) => {
+      if (job.id !== packId.current) return
+      packedSigRef.current = packSig
+      setPlacements(next)
+      setPacking(false)
+    }
+    const runSync = () => {
+      const next = job.fill
+        ? fillSpareHole(
+            job.fill.placements,
+            job.photos,
+            job.page,
+            job.options.gutter,
+            job.fill.hole,
+            job.options.layout,
+          )
+        : pack(job.photos, job.page, job.options)
+      finish(next)
+    }
     const stop = afterPaint(() => {
-      if (id !== packId.current) return
+      if (job.id !== packId.current) return
       try {
         worker = new PackWorker()
       } catch {
-        const next = pack(job.photos, job.page, job.options)
-        if (id === packId.current) {
-          setPlacements(next)
-          setPacking(false)
-        }
+        runSync()
         return
       }
       worker.onmessage = (event: MessageEvent<PackResult>) => {
-        if (event.data.id !== packId.current) return
-        setPlacements(event.data.placements)
-        setPacking(false)
+        finish(event.data.placements)
       }
       worker.onerror = () => {
-        if (id !== packId.current) return
-        setPlacements(pack(job.photos, job.page, job.options))
-        setPacking(false)
+        if (job.id !== packId.current) return
+        runSync()
       }
       worker.postMessage(job)
     })
@@ -270,17 +283,40 @@ function App() {
       stop()
       worker?.terminate()
     }
-  }, [photos, page, packOptions])
+  }
 
-  function runBusy(work: () => void) {
+  useEffect(() => {
+    const id = ++packId.current
+    cancelJob.current?.()
+    if (photos.length === 0) {
+      packedSigRef.current = packSig
+      setPlacements([])
+      setPacking(false)
+      cancelJob.current = null
+      return
+    }
     setPacking(true)
-    afterPaint(() => {
-      try {
-        work()
-      } finally {
-        setPacking(false)
-      }
-    })
+    const job: PackJob = { id, photos, page: hintPage, options: packOptions }
+    cancelJob.current = runJob(job)
+    return () => {
+      cancelJob.current?.()
+      cancelJob.current = null
+    }
+  }, [photos, hintPage, packOptions])
+
+  function fillHole(hole: Rect) {
+    if (photos.length === 0) return
+    const id = ++packId.current
+    cancelJob.current?.()
+    setPacking(true)
+    const job: PackJob = {
+      id,
+      photos,
+      page,
+      options: packOptions,
+      fill: { placements, hole },
+    }
+    cancelJob.current = runJob(job)
   }
 
   function commit(list: Photo[], breakAt: number) {
@@ -496,7 +532,9 @@ function App() {
             onClick={() => {
               setExportError(null)
               setExporting(true)
-              void exportPackedPage(page, photos, placements, exportSize, focusCount)
+              void exportPackedPage(page, photos, placements, exportSize, focusCount, {
+                  transparent: layout === 'boundless',
+                })
                 .catch((error: unknown) => {
                   setExportError(error instanceof Error ? error.message : 'Export failed.')
                 })
@@ -511,12 +549,12 @@ function App() {
         <span className="toolbar-end">
           <span className="counts-wrap">
             <span
-              className={`preview-spin${packing ? ' on' : ''}`}
-              role={packing ? 'status' : undefined}
+              className={`preview-spin${showSpin ? ' on' : ''}`}
+              role={showSpin ? 'status' : undefined}
               aria-live="polite"
-              aria-label={packing ? 'Updating preview' : undefined}
-              aria-hidden={!packing}
-              title={packing ? 'Updating preview' : undefined}
+              aria-label={showSpin ? 'Updating preview' : undefined}
+              aria-hidden={!showSpin}
+              title={showSpin ? 'Updating preview' : undefined}
             >
               <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden>
                 <circle
@@ -608,7 +646,7 @@ function App() {
           onDelete={deletePhoto}
           onStar={promoteToFocus}
         />
-        <div className={selected ? 'stage editing' : 'stage preview'}>
+        <div className={selected ? 'stage editing' : `stage preview${layout === 'boundless' ? ' boundless' : ''}`}>
           {selected ? (
             <CropEditor
               photo={selected}
@@ -618,22 +656,43 @@ function App() {
               onClose={() => setSelectedId(null)}
             />
           ) : (
-            <PagePreview
-              page={page}
-              photos={photos}
-              placements={placements}
-              selectedId={selectedId}
-              onSelect={setSelectedId}
-              onPlacements={setPlacements}
-              gutter={gutter}
-              packing={packing}
-              onBusy={runBusy}
-              spares={photos.filter((photo) => !packedIds.has(photo.id))}
-              modifying={modifying}
-              starring={starring}
-              onDelete={deletePhoto}
-              onStar={promoteToFocus}
-            />
+            <>
+              <PagePreview
+                page={page}
+                photos={photos}
+                placements={placements}
+                selectedId={selectedId}
+                onSelect={setSelectedId}
+                onPlacements={setPlacements}
+                gutter={gutter}
+                packing={showSpin}
+                onFillHole={fillHole}
+                boundless={layout === 'boundless'}
+                spares={photos.filter((photo) => !packedIds.has(photo.id))}
+                modifying={modifying}
+                starring={starring}
+                onDelete={deletePhoto}
+                onStar={promoteToFocus}
+              />
+              {showSpin ? (
+                <div className="pack-overlay" role="status" aria-label="Updating preview">
+                  <span className="pack-overlay-spin" aria-hidden>
+                    <svg viewBox="0 0 16 16" width="36" height="36">
+                      <circle
+                        cx="8"
+                        cy="8"
+                        r="5.5"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.7"
+                        strokeLinecap="round"
+                        strokeDasharray="18 16"
+                      />
+                    </svg>
+                  </span>
+                </div>
+              ) : null}
+            </>
           )}
         </div>
       </div>

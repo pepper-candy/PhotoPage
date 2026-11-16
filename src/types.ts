@@ -1,5 +1,5 @@
 export type PhotoGroup = 'focus' | 'niche'
-export type LayoutMode = 'top' | 'bottom' | 'ring' | 'center'
+export type LayoutMode = 'top' | 'bottom' | 'ring' | 'center' | 'boundless'
 
 export type Rect = {
   x: number
@@ -35,6 +35,7 @@ export type PackJob = {
   photos: Photo[]
   page: Page
   options: PackOptions
+  fill?: { placements: Placement[]; hole: Rect }
 }
 
 export type PackResult = {

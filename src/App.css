@@ -420,11 +420,35 @@
 }
 
 .stage {
+  position: relative;
   min-width: 0;
   min-height: 0;
   height: 100%;
   background: #121317;
   overflow: hidden;
+}
+
+.pack-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(11, 12, 15, 0.46);
+}
+
+.pack-overlay-spin {
+  width: 36px;
+  height: 36px;
+  color: #e8eaef;
+  animation: preview-spin 0.7s linear infinite;
+}
+
+.pack-overlay-spin svg {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 .stage.preview {
@@ -433,6 +457,12 @@
   place-items: center;
   padding: 36px;
   box-sizing: border-box;
+}
+
+.stage.preview.boundless {
+  background-color: #121317;
+  background-image: radial-gradient(#3a3d48 1.1px, transparent 1.2px);
+  background-size: 18px 18px;
 }
 
 .stage.editing {
@@ -449,6 +479,12 @@
     0 0 0 1px #454955,
     0 18px 48px rgba(0, 0, 0, 0.38);
   overflow: hidden;
+}
+
+.page.boundless {
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
 }
 
 .placed {
