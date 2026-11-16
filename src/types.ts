@@ -30,6 +30,18 @@ export type PackOptions = {
   includeAll: boolean
 }
 
+export type PackJob = {
+  id: number
+  photos: Photo[]
+  page: Page
+  options: PackOptions
+}
+
+export type PackResult = {
+  id: number
+  placements: Placement[]
+}
+
 export type Placement = {
   photoId: string
   x: number

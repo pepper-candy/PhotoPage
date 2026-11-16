@@ -4,13 +4,17 @@ import PagePreview from './PagePreview.tsx'
 import PhotoTray from './PhotoTray.tsx'
 import { EXPORT_SIZES, exportPackedPage, type ExportSizeId } from './exportPage.ts'
 import { pack } from './packer.ts'
+import PackWorker from './packWorker.ts?worker'
 import {
   DEFAULT_GUTTER,
   DEFAULT_LAYOUT,
   pageSize,
   type LayoutMode,
+  type PackJob,
+  type PackResult,
   type Photo,
   type PhotoGroup,
+  type Placement,
   type Rect,
 } from './types.ts'
 import './App.css'
@@ -101,6 +105,9 @@ function App() {
   const [exporting, setExporting] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [modifying, setModifying] = useState(false)
+  const [placements, setPlacements] = useState<Placement[]>([])
+  const [packing, setPacking] = useState(false)
+  const packId = useRef(0)
 
   const activePreset = PRESETS.find((item) => item.id === preset) ?? PRESETS[1]
   const aspectW = preset === 'custom' ? customW : activePreset.w
@@ -109,16 +116,16 @@ function App() {
   const safeH = aspectH > 0 ? aspectH : 1
 
   const page = useMemo(() => pageSize(safeW, safeH), [safeW, safeH])
-  const placements = useMemo(
-    () => pack(photos, page, { gutter, breakIndex, layout, includeAll }),
-    [photos, page, gutter, breakIndex, layout, includeAll],
-  )
   const packedIds = useMemo(
     () => new Set(placements.map((item) => item.photoId)),
     [placements],
   )
   const focusCount = Math.min(breakIndex, photos.length)
   const selected = photos.find((photo) => photo.id === selectedId) ?? null
+  const packOptions = useMemo(
+    () => ({ gutter, breakIndex, layout, includeAll }),
+    [gutter, breakIndex, layout, includeAll],
+  )
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -127,6 +134,42 @@ function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [])
+
+  useEffect(() => {
+    const id = ++packId.current
+    if (photos.length === 0) {
+      setPlacements([])
+      setPacking(false)
+      return
+    }
+    setPacking(true)
+    const job: PackJob = { id, photos, page, options: packOptions }
+    let worker: Worker
+    try {
+      worker = new PackWorker()
+    } catch {
+      const next = pack(job.photos, job.page, job.options)
+      if (id === packId.current) {
+        setPlacements(next)
+        setPacking(false)
+      }
+      return
+    }
+    worker.onmessage = (event: MessageEvent<PackResult>) => {
+      if (event.data.id !== packId.current) return
+      setPlacements(event.data.placements)
+      setPacking(false)
+    }
+    worker.onerror = () => {
+      if (id !== packId.current) return
+      setPlacements(pack(job.photos, job.page, job.options))
+      setPacking(false)
+    }
+    worker.postMessage(job)
+    return () => {
+      worker.terminate()
+    }
+  }, [photos, page, packOptions])
 
   function commit(list: Photo[], breakAt: number) {
     const cut = Math.max(0, Math.min(list.length, breakAt))
@@ -200,6 +243,19 @@ function App() {
     if (from < cut) cut -= 1
     next.splice(cut, 0, item)
     commit(next, cut)
+  }
+
+  function shuffleNiche() {
+    const start = Math.max(0, Math.min(breakIndex, photos.length))
+    if (photos.length - start < 2) return
+    const next = photos.slice()
+    for (let i = next.length - 1; i > start; i--) {
+      const j = start + Math.floor(Math.random() * (i - start + 1))
+      const swap = next[i]
+      next[i] = next[j]
+      next[j] = swap
+    }
+    commit(next, start)
   }
 
   const countLabel = `${photos.length} ${photos.length === 1 ? 'photo' : 'photos'} · ${focusCount} focus`
@@ -327,7 +383,30 @@ function App() {
         {exportError ? <span className="export-error">{exportError}</span> : null}
 
         <span className="toolbar-end">
-          <span className="counts">{countLabel}</span>
+          <span className="counts-wrap">
+            <span
+              className={`preview-spin${packing ? ' on' : ''}`}
+              role={packing ? 'status' : undefined}
+              aria-live="polite"
+              aria-label={packing ? 'Updating preview' : undefined}
+              aria-hidden={!packing}
+              title={packing ? 'Updating preview' : undefined}
+            >
+              <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden>
+                <circle
+                  cx="8"
+                  cy="8"
+                  r="5.5"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.7"
+                  strokeLinecap="round"
+                  strokeDasharray="18 16"
+                />
+              </svg>
+            </span>
+            <span className="counts">{countLabel}</span>
+          </span>
           <span className="toolbar-split" aria-hidden />
           <button
             type="button"
@@ -376,6 +455,7 @@ function App() {
           onBreakIndex={(index) => commit(photos, index)}
           includeAll={includeAll}
           onIncludeAll={setIncludeAll}
+          onShuffleNiche={shuffleNiche}
           packedIds={packedIds}
           modifying={modifying}
           onDelete={deletePhoto}

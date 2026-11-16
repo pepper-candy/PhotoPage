@@ -949,6 +949,447 @@ function rowPlan(photos: Photo[], region: Rect, gutter: number, includeAll: bool
   return null
 }
 
+function finiteCap(maxArea?: number): number | undefined {
+  if (maxArea == null || !Number.isFinite(maxArea)) return undefined
+  return maxArea
+}
+
+function cappedRowLimits(
+  row: Photo[],
+  width: number,
+  gutter: number,
+  maxArea?: number,
+  minHeight = 0,
+): Limits | null {
+  const base = rowLimits(row, width, gutter)
+  const cap = finiteCap(maxArea)
+  const floor = Math.max(8, minHeight)
+  if (cap == null) {
+    if (floor <= base.hMin + 0.5) return base
+    if (floor > base.hMax + 0.5) return null
+    return { ...base, hMin: floor, hPref: clamp(base.hPref, floor, base.hMax) }
+  }
+  if (!(base.hMax + 1e-3 >= base.hMin)) return null
+  const specs = row.map((photo) => legalAspectRange(photo))
+  const ok = (h: number) => {
+    if (h + 0.25 < floor) return false
+    let sumMin = 0
+    let sumMax = 0
+    for (const spec of specs) {
+      const upper = Math.min(spec.max, cap / (h * h))
+      if (spec.min > upper + 1e-4) return false
+      sumMin += spec.min
+      sumMax += upper
+    }
+    const need = base.inner / h
+    return sumMin <= need + 1e-3 && sumMax + 1e-3 >= need
+  }
+  const steps = 28
+  const at = (i: number) => base.hMin + ((base.hMax - base.hMin) * i) / steps
+  const good: number[] = []
+  for (let i = 0; i <= steps; i++) if (ok(at(i))) good.push(i)
+  if (good.length === 0) return null
+  let runStart = good[0]
+  let runEnd = good[0]
+  let bestStart = good[0]
+  let bestEnd = good[0]
+  let bestDist = Infinity
+  const pref = base.hPref
+  const consider = (start: number, end: number) => {
+    const mid = (at(start) + at(end)) / 2
+    const dist = Math.abs(mid - pref)
+    if (dist < bestDist) {
+      bestDist = dist
+      bestStart = start
+      bestEnd = end
+    }
+  }
+  for (let i = 1; i < good.length; i++) {
+    if (good[i] === runEnd + 1) runEnd = good[i]
+    else {
+      consider(runStart, runEnd)
+      runStart = good[i]
+      runEnd = good[i]
+    }
+  }
+  consider(runStart, runEnd)
+  let lo = at(bestStart)
+  let hi = at(bestEnd)
+  if (bestStart > 0) {
+    let a = at(bestStart - 1)
+    let b = lo
+    for (let i = 0; i < 12; i++) {
+      const mid = (a + b) / 2
+      if (ok(mid)) b = mid
+      else a = mid
+    }
+    lo = b
+  }
+  if (bestEnd < steps) {
+    let a = hi
+    let b = at(bestEnd + 1)
+    for (let i = 0; i < 12; i++) {
+      const mid = (a + b) / 2
+      if (ok(mid)) a = mid
+      else b = mid
+    }
+    hi = a
+  }
+  if (hi < lo - 1e-3) return null
+  return { inner: base.inner, hMin: lo, hMax: hi, hPref: clamp(pref, lo, hi) }
+}
+
+function exactWidths(row: Photo[], height: number, inner: number, cap?: number): number[] | null {
+  const finite = finiteCap(cap)
+  const specs = row.map((photo) => {
+    const { min, max } = legalAspectRange(photo)
+    const minW = min * height
+    let maxW = max * height
+    if (finite != null) maxW = Math.min(maxW, finite / Math.max(height, 0.001) - 0.08)
+    maxW = Math.max(minW, maxW)
+    return {
+      minW,
+      maxW,
+      pref: clamp(preferredAspect(photo) * height, minW, maxW),
+    }
+  })
+  const sum = (values: number[]) => values.reduce((total, value) => total + value, 0)
+  if (specs.some((spec) => spec.minW > spec.maxW + 0.75)) return null
+  if (sum(specs.map((spec) => spec.minW)) > inner + 0.75) return null
+  if (sum(specs.map((spec) => spec.maxW)) < inner - 0.75) return null
+  let widths = specs.map((spec) => spec.pref)
+  for (let iter = 0; iter < 12; iter++) {
+    const diff = inner - sum(widths)
+    if (Math.abs(diff) <= 0.2) break
+    let roomSum = 0
+    const room = widths.map((width, index) => {
+      const space = diff > 0 ? specs[index].maxW - width : width - specs[index].minW
+      const open = Math.max(0, space)
+      roomSum += open
+      return open
+    })
+    if (roomSum <= 0.01) break
+    const take = Math.min(Math.abs(diff), roomSum)
+    widths = widths.map(
+      (width, index) => width + Math.sign(diff) * (room[index] / roomSum) * take,
+    )
+  }
+  let drift = inner - sum(widths)
+  if (Math.abs(drift) > 0.05) {
+    for (let i = 0; i < widths.length && Math.abs(drift) > 0.05; i++) {
+      const next = clamp(widths[i] + drift, specs[i].minW, specs[i].maxW)
+      drift -= next - widths[i]
+      widths[i] = next
+    }
+  }
+  let err = inner - sum(widths)
+  const last = widths.length - 1
+  widths[last] += err
+  if (widths[last] > specs[last].maxW) {
+    let extra = widths[last] - specs[last].maxW
+    widths[last] = specs[last].maxW
+    for (let i = 0; i < last && extra > 0.01; i++) {
+      const room = specs[i].maxW - widths[i]
+      const take = Math.min(Math.max(0, room), extra)
+      widths[i] += take
+      extra -= take
+    }
+    err = extra
+  } else {
+    err = 0
+  }
+  if (widths[last] < specs[last].minW - 0.75) return null
+  if (err > 1.5) return null
+  if (finite != null && widths.some((width) => width * height > finite + 0.75 * height)) return null
+  return widths
+}
+
+function layoutExact(
+  rows: Photo[][],
+  heights: number[],
+  region: Rect,
+  gutter: number,
+  maxArea?: number,
+): Placement[] | null {
+  const placed: Placement[] = []
+  let y = region.y
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r]
+    const lastRow = r === rows.length - 1
+    const h = lastRow ? region.y + region.h - y : heights[r]
+    if (!(h >= 8)) return null
+    const gaps = Math.max(0, row.length - 1) * gutter
+    const inner = region.w - gaps
+    const widths = exactWidths(row, h, inner, maxArea)
+    if (!widths) return null
+    let x = region.x
+    for (let i = 0; i < row.length; i++) {
+      const w = widths[i]
+      if (!(w >= 8)) return null
+      const aspect = w / h
+      const { min, max } = legalAspectRange(row[i])
+      if (aspect < min - 1e-3 || aspect > max + 1e-3) return null
+      const cap = finiteCap(maxArea)
+      if (cap != null && w * h > cap + 0.5) return null
+      placed.push(fillCell(row[i], { x, y, w, h }))
+      x += w
+      if (i < row.length - 1) x += gutter
+    }
+    if (Math.abs(x - (region.x + region.w)) > 1.25) return null
+    y += h
+    if (!lastRow) y += gutter
+  }
+  if (Math.abs(y - (region.y + region.h)) > 1.25) return null
+  return placed
+}
+
+type RowCover = { rows: Photo[][]; heights: number[] }
+
+function coveringPartition(
+  photos: Photo[],
+  width: number,
+  height: number,
+  gutter: number,
+  maxArea?: number,
+  minHeight = 0,
+): RowCover | null {
+  const n = photos.length
+  if (n === 0 || width < 8 || height < 8) return null
+  const limitsAt = new Map<string, Limits | null>()
+  const limitsOf = (start: number, len: number) => {
+    const key = `${start}:${len}`
+    const cached = limitsAt.get(key)
+    if (cached !== undefined) return cached
+    const lim = cappedRowLimits(photos.slice(start, start + len), width, gutter, maxArea, minHeight)
+    limitsAt.set(key, lim)
+    return lim
+  }
+  const mergeIv = (list: { min: number; max: number }[]) => {
+    if (list.length === 0) return []
+    list.sort((a, b) => a.min - b.min || a.max - b.max)
+    const merged = [{ min: list[0].min, max: list[0].max }]
+    for (let i = 1; i < list.length; i++) {
+      const last = merged[merged.length - 1]
+      if (list[i].min <= last.max + 0.4) last.max = Math.max(last.max, list[i].max)
+      else merged.push({ min: list[i].min, max: list[i].max })
+    }
+    return merged
+  }
+  const ach: { min: number; max: number }[][] = Array(n + 1)
+  ach[n] = [{ min: 0, max: 0 }]
+  for (let i = n - 1; i >= 0; i--) {
+    const acc: { min: number; max: number }[] = []
+    const remain = n - i
+    for (let len = 1; len <= remain; len++) {
+      const lim = limitsOf(i, len)
+      const rest = ach[i + len]
+      if (!lim || !rest) continue
+      const gap = i + len === n ? 0 : gutter
+      for (const iv of rest) {
+        acc.push({ min: lim.hMin + gap + iv.min, max: lim.hMax + gap + iv.max })
+      }
+    }
+    ach[i] = mergeIv(acc)
+  }
+  const root = ach[0] ?? []
+  if (!root.some((iv) => height >= iv.min - EPS && height <= iv.max + EPS)) return null
+
+  const buildMemo = new Map<string, RowCover | null>()
+  const build = (index: number, heightLeft: number): RowCover | null => {
+    const key = `${index}:${heightLeft.toFixed(2)}`
+    if (buildMemo.has(key)) return buildMemo.get(key) ?? null
+    if (index === n) {
+      const done = Math.abs(heightLeft) <= 0.8 ? { rows: [], heights: [] } : null
+      buildMemo.set(key, done)
+      return done
+    }
+    const bands = ach[index] ?? []
+    if (!bands.some((iv) => heightLeft >= iv.min - EPS && heightLeft <= iv.max + EPS)) {
+      buildMemo.set(key, null)
+      return null
+    }
+    for (let len = 1; len <= n - index; len++) {
+      const lim = limitsOf(index, len)
+      if (!lim) continue
+      const last = index + len === n
+      if (last) {
+        if (heightLeft < lim.hMin - EPS || heightLeft > lim.hMax + EPS) continue
+        const done = { rows: [photos.slice(index, index + len)], heights: [heightLeft] }
+        buildMemo.set(key, done)
+        return done
+      }
+      const rest = ach[index + len] ?? []
+      for (const iv of rest) {
+        const lo = Math.max(lim.hMin, heightLeft - gutter - iv.max)
+        const hi = Math.min(lim.hMax, heightLeft - gutter - iv.min)
+        if (lo > hi + EPS) continue
+        const h = clamp(lim.hPref, lo, hi)
+        const built = build(index + len, heightLeft - h - gutter)
+        if (!built) continue
+        const done = {
+          rows: [photos.slice(index, index + len), ...built.rows],
+          heights: [h, ...built.heights],
+        }
+        buildMemo.set(key, done)
+        return done
+      }
+    }
+    buildMemo.set(key, null)
+    return null
+  }
+  return build(0, height)
+}
+
+function regionCovered(region: Rect, placed: Placement[], gutter: number): boolean {
+  if (placed.length === 0) return false
+  const slack = Math.max(1.5, gutter)
+  return leftoverHoles(region, placed, gutter).every((hole) => Math.min(hole.w, hole.h) <= slack)
+}
+
+const coverMemo = new Map<string, Placement[] | null>()
+
+function coverSplits(region: Rect, gutter: number): [Rect, Rect][] {
+  const g = Math.max(0, gutter)
+  const out: [Rect, Rect][] = []
+  const addV = (fraction: number) => {
+    if (region.w <= g + 36) return
+    const w1 = (region.w - g) * fraction
+    const w2 = region.w - g - w1
+    if (w1 < 16 || w2 < 16) return
+    out.push([
+      { x: region.x, y: region.y, w: w1, h: region.h },
+      { x: region.x + w1 + g, y: region.y, w: w2, h: region.h },
+    ])
+  }
+  const addH = (fraction: number) => {
+    if (region.h <= g + 36) return
+    const h1 = (region.h - g) * fraction
+    const h2 = region.h - g - h1
+    if (h1 < 16 || h2 < 16) return
+    out.push([
+      { x: region.x, y: region.y, w: region.w, h: h1 },
+      { x: region.x, y: region.y + h1 + g, w: region.w, h: h2 },
+    ])
+  }
+  if (region.w >= region.h) {
+    addV(0.5)
+    addV(0.4)
+    addV(0.6)
+    addH(0.5)
+  } else {
+    addH(0.5)
+    addH(0.4)
+    addH(0.6)
+    addV(0.5)
+  }
+  return out
+}
+
+function coverByRows(
+  photos: Photo[],
+  region: Rect,
+  gutter: number,
+  includeAll: boolean,
+  maxArea?: number,
+): Placement[] | null {
+  const area = cellArea(region)
+  const cap = finiteCap(maxArea)
+  const start = !includeAll && cap != null ? Math.max(1, Math.ceil(area / cap) - 2) : 1
+  const counts = includeAll ? [photos.length] : []
+  if (!includeAll) {
+    for (let k = start; k <= photos.length; k++) counts.push(k)
+  }
+  for (const count of counts) {
+    if (count < 1 || count > photos.length) continue
+    const fair = Math.min(cap ?? area, area / Math.max(1, count))
+    const minH = Math.max(24, Math.sqrt((fair * 0.45) / 1.9))
+    const part = coveringPartition(
+      photos.slice(0, count),
+      region.w,
+      region.h,
+      gutter,
+      maxArea,
+      minH,
+    )
+    if (!part) continue
+    const placed = layoutExact(part.rows, part.heights, region, gutter, maxArea)
+    if (placed && regionCovered(region, placed, gutter)) {
+      if (!includeAll && placed.length > 1) {
+        const areas = placed.map(cellArea)
+        if (Math.min(...areas) < Math.max(...areas) * 0.4) continue
+      }
+      return placed
+    }
+  }
+  return null
+}
+
+function coverRegion(
+  photos: Photo[],
+  region: Rect,
+  gutter: number,
+  includeAll: boolean,
+  maxArea: number | undefined,
+  depth: number,
+): Placement[] | null {
+  if (photos.length === 0 || region.w < 8 || region.h < 8) return null
+  const capKey = finiteCap(maxArea) ?? 'inf'
+  const key = [
+    photos[0].id,
+    photos.length,
+    Math.round(region.x),
+    Math.round(region.y),
+    Math.round(region.w),
+    Math.round(region.h),
+    includeAll ? 1 : 0,
+    capKey,
+    Math.round(gutter * 10),
+    depth,
+  ].join(':')
+  if (coverMemo.has(key)) return coverMemo.get(key) ?? null
+
+  const rows = coverByRows(photos, region, gutter, includeAll, maxArea)
+  if (rows) {
+    coverMemo.set(key, rows)
+    return rows
+  }
+  if (depth >= 1 || photos.length < 2) {
+    coverMemo.set(key, null)
+    return null
+  }
+
+  let best: Placement[] | null = null
+  for (const parts of coverSplits(region, gutter)) {
+    const maxK = photos.length - 1
+    const share = cellArea(parts[0]) / Math.max(1, cellArea(parts[0]) + cellArea(parts[1]))
+    const ideal = clamp(Math.round(photos.length * share), 1, maxK)
+    const ks: number[] = []
+    const span = includeAll ? Math.min(10, maxK) : maxK
+    for (let delta = 0; delta <= span; delta++) {
+      if (ideal - delta >= 1) ks.push(ideal - delta)
+      if (delta > 0 && ideal + delta <= maxK) ks.push(ideal + delta)
+    }
+    for (const k of ks) {
+      if (!includeAll && best && k >= best.length) continue
+      const left = coverRegion(photos.slice(0, k), parts[0], gutter, true, maxArea, depth + 1)
+      if (!left || left.length !== k) continue
+      const right = coverRegion(photos.slice(k), parts[1], gutter, includeAll, maxArea, depth + 1)
+      if (!right || right.length === 0) continue
+      const placed = [...left, ...right]
+      if (!regionCovered(region, placed, gutter)) continue
+      if (includeAll && placed.length !== photos.length) continue
+      if (!includeAll && best && placed.length >= best.length) continue
+      best = placed
+      if (includeAll || !includeAll) {
+        coverMemo.set(key, best)
+        return best
+      }
+    }
+  }
+  coverMemo.set(key, best)
+  return best
+}
+
 function slicePack(
   photos: Photo[],
   region: Rect,
@@ -959,6 +1400,19 @@ function slicePack(
   depth = 0,
 ): Placement[] {
   if (photos.length === 0 || region.w < 8 || region.h < 8) return []
+  if (depth === 0 && Math.min(region.w, region.h) < 36) return []
+  if (depth === 0) {
+    const covered = coverRegion(photos, region, gutter, includeAll, maxArea, 0)
+    if (
+      covered &&
+      covered.length > 0 &&
+      regionCovered(region, covered, gutter) &&
+      (!includeAll || covered.length === photos.length)
+    ) {
+      return covered
+    }
+    if (!includeAll) return []
+  }
   const cap = maxArea ?? Number.POSITIVE_INFINITY
   const regionArea = cellArea(region)
   const goal = Math.min(
@@ -1381,6 +1835,172 @@ function spanSlice(
   return toward % 2 === 1 ? (tryW() ?? tryH()) : (tryH() ?? tryW())
 }
 
+function bandCut(
+  photo: Photo,
+  region: Rect,
+  areaWanted: number,
+  anchor: number,
+  gutter: number,
+): { box: Rect; rest: Rect } | null {
+  const { min, max } = legalAspectRange(photo)
+  const g = Math.max(0, gutter)
+  const options: { box: Rect; rest: Rect; score: number }[] = []
+  const hLo = region.w / max
+  const hHi = Math.min(region.w / min, region.h - g - 28)
+  if (hLo <= hHi + 0.5 && hHi >= 18) {
+    const h = clamp(areaWanted / Math.max(region.w, 1), Math.max(18, hLo), hHi)
+    if (region.h - h - g >= 28) {
+      const top = anchor % 2 === 0
+      const box = { x: region.x, y: top ? region.y : region.y + region.h - h, w: region.w, h }
+      const rest = {
+        x: region.x,
+        y: top ? region.y + h + g : region.y,
+        w: region.w,
+        h: region.h - h - g,
+      }
+      options.push({ box, rest, score: Math.abs(box.w * box.h - areaWanted) })
+    }
+  }
+  const wLo = region.h * min
+  const wHi = Math.min(region.h * max, region.w - g - 28)
+  if (wLo <= wHi + 0.5 && wHi >= 18) {
+    const w = clamp(areaWanted / Math.max(region.h, 1), Math.max(18, wLo), wHi)
+    if (region.w - w - g >= 28) {
+      const left = anchor % 4 < 2
+      const box = { x: left ? region.x : region.x + region.w - w, y: region.y, w, h: region.h }
+      const rest = {
+        x: left ? region.x + w + g : region.x,
+        y: region.y,
+        w: region.w - w - g,
+        h: region.h,
+      }
+      options.push({ box, rest, score: Math.abs(box.w * box.h - areaWanted) })
+    }
+  }
+  options.sort((a, b) => a.score - b.score)
+  return options[0] ?? null
+}
+
+function stackBeside(
+  focus: Photo,
+  niches: Photo[],
+  region: Rect,
+  gutter: number,
+  focusLeft: boolean,
+  minRatio = FOCUS_MIN_RATIO,
+): Placement[] | null {
+  const g = Math.max(0, gutter)
+  if (niches.length === 0) {
+    if (!fitsAspect(focus, region.w, region.h)) return null
+    return [fillCell(focus, region)]
+  }
+  const gaps = g * (niches.length - 1)
+  const rh = (region.h - gaps) / niches.length
+  if (rh < 24) return null
+  let rwLo = 0
+  let rwHi = Number.POSITIVE_INFINITY
+  for (const photo of niches) {
+    const range = legalAspectRange(photo)
+    rwLo = Math.max(rwLo, range.min * rh)
+    rwHi = Math.min(rwHi, range.max * rh)
+  }
+  if (!(rwLo <= rwHi)) return null
+  const { min, max } = legalAspectRange(focus)
+  const inner = region.w - g
+  const fwMin = Math.max(min * region.h, inner - rwHi)
+  const fwMax = Math.min(max * region.h, inner - rwLo, region.w - g - 24)
+  if (!(fwMin <= fwMax)) return null
+  const fwIdeal = (FOCUS_MIN_RATIO * rh * inner) / (region.h + FOCUS_MIN_RATIO * rh)
+  const fw = clamp(fwIdeal, fwMin, fwMax)
+  const rw = inner - fw
+  const ratio = (fw * region.h) / Math.max(rw * rh, 1)
+  if (ratio < minRatio - 0.03 || ratio > 4.5) return null
+  if (niches.some((photo) => !fitsAspect(photo, rw, rh))) return null
+  const fx = focusLeft ? region.x : region.x + region.w - fw
+  const rx = focusLeft ? region.x + fw + g : region.x
+  const placed: Placement[] = [fillCell(focus, { x: fx, y: region.y, w: fw, h: region.h })]
+  let y = region.y
+  niches.forEach((photo, index) => {
+    const h = index === niches.length - 1 ? region.y + region.h - y : rh
+    if (!fitsAspect(photo, rw, h)) return
+    placed.push(fillCell(photo, { x: rx, y, w: rw, h }))
+    y += h + g
+  })
+  if (placed.length !== niches.length + 1) return null
+  return placed
+}
+
+function stackUnder(
+  focus: Photo,
+  niches: Photo[],
+  region: Rect,
+  gutter: number,
+  focusTop: boolean,
+  minRatio = FOCUS_MIN_RATIO,
+): Placement[] | null {
+  const g = Math.max(0, gutter)
+  if (niches.length === 0) return null
+  const gaps = g * (niches.length - 1)
+  const rw = (region.w - gaps) / niches.length
+  if (rw < 24) return null
+  let rhLo = 0
+  let rhHi = Number.POSITIVE_INFINITY
+  for (const photo of niches) {
+    const range = legalAspectRange(photo)
+    rhLo = Math.max(rhLo, rw / range.max)
+    rhHi = Math.min(rhHi, rw / range.min)
+  }
+  if (!(rhLo <= rhHi)) return null
+  const { min, max } = legalAspectRange(focus)
+  const inner = region.h - g
+  const fhMin = Math.max(region.w / max, inner - rhHi)
+  const fhMax = Math.min(region.w / min, inner - rhLo, region.h - g - 24)
+  if (!(fhMin <= fhMax)) return null
+  const fh = clamp(region.h * (FOCUS_MIN_RATIO / (FOCUS_MIN_RATIO + niches.length)), fhMin, fhMax)
+  const rh = inner - fh
+  if (niches.some((photo) => !fitsAspect(photo, rw, rh))) return null
+  const nicheArea = rw * rh
+  const ratio = (region.w * fh) / Math.max(nicheArea, 1)
+  if (ratio < minRatio - 0.03 || ratio > 4.5) return null
+  const fy = focusTop ? region.y : region.y + region.h - fh
+  const ny = focusTop ? region.y + fh + g : region.y
+  const placed: Placement[] = [fillCell(focus, { x: region.x, y: fy, w: region.w, h: fh })]
+  let x = region.x
+  niches.forEach((photo, index) => {
+    const w = index === niches.length - 1 ? region.x + region.w - x : rw
+    if (!fitsAspect(photo, w, rh)) return
+    placed.push(fillCell(photo, { x, y: ny, w, h: rh }))
+    x += w + g
+  })
+  if (placed.length !== niches.length + 1) return null
+  return placed
+}
+
+function bestQuadrant(
+  focus: Photo,
+  niches: Photo[],
+  region: Rect,
+  gutter: number,
+  minRatio = FOCUS_MIN_RATIO,
+): Placement[] | null {
+  const found = [
+    stackBeside(focus, niches, region, gutter, true, minRatio),
+    stackBeside(focus, niches, region, gutter, false, minRatio),
+    stackUnder(focus, niches, region, gutter, true, minRatio),
+    stackUnder(focus, niches, region, gutter, false, minRatio),
+  ].filter((item): item is Placement[] => item != null)
+  if (found.length === 0) return null
+  const score = (placed: Placement[]) => {
+    const focusCell = placed[0]
+    const rest = placed.slice(1)
+    const focusArea = cellArea(focusCell)
+    const nicheArea = rest.length ? Math.max(...rest.map(cellArea)) : focusArea
+    return Math.abs(focusArea / nicheArea - FOCUS_MIN_RATIO)
+  }
+  found.sort((a, b) => score(a) - score(b))
+  return found[0]
+}
+
 function packScattered(
   focus: Photo[],
   niche: Photo[],
@@ -1399,27 +2019,107 @@ function packScattered(
     )
   }
 
+  if (!includeAll) {
+    const regions = splitRegions(full, focus.length, gutter)
+    const placed: Placement[] = []
+    let rest = niche.slice()
+    regions.forEach((region, index) => {
+      const photo = focus[Math.min(index, focus.length - 1)]
+      const hit =
+        bestQuadrant(photo, rest.slice(0, 2), region, gutter) ??
+        bestQuadrant(photo, rest.slice(0, 1), region, gutter) ??
+        bestQuadrant(photo, rest.slice(0, 2), region, gutter, 0.85) ??
+        bestQuadrant(photo, rest.slice(0, 1), region, gutter, 0.85)
+      if (!hit) {
+        const range = legalAspectRange(photo)
+        const pref = preferredAspect(photo)
+        let fh = region.h
+        let fw = clamp(pref * fh, range.min * fh, range.max * fh)
+        if (fw > region.w - 48) {
+          fw = Math.min(fw, region.w * 0.48)
+          fh = clamp(fw / pref, fw / range.max, Math.min(region.h, fw / range.min))
+        }
+        fw = Math.min(fw, region.w)
+        fh = Math.min(fh, region.h)
+        const box = { x: region.x, y: region.y, w: fw, h: fh }
+        const manual: Placement[] = [fillCell(photo, box)]
+        const niche = rest[0]
+        const sideW = region.w - fw - gutter
+        if (niche && sideW > 64 && fh > 64) {
+          const nicheRange = legalAspectRange(niche)
+          const nw = clamp(preferredAspect(niche) * fh, nicheRange.min * fh, nicheRange.max * fh)
+          if (nw >= 48 && nw <= sideW + 2) {
+            manual.push(fillCell(niche, { x: region.x + fw + gutter, y: region.y, w: Math.min(nw, sideW), h: fh }))
+          }
+        }
+        placed.push(...manual)
+        const used = new Set(manual.map((item) => item.photoId))
+        rest = rest.filter((item) => !used.has(item.id))
+        return
+      }
+      placed.push(...hit)
+      const used = new Set(hit.map((item) => item.photoId))
+      rest = rest.filter((item) => !used.has(item.id))
+    })
+    return placed
+  }
+
   const targetA = minFocusCellArea(full, focus.length, niche.length, includeAll)
   const regions = splitRegions(full, focus.length, gutter)
+  const perRegion = includeAll
+    ? Math.max(1, Math.ceil(niche.length / Math.max(1, focus.length)))
+    : 2
+  const focusArea = Math.max(
+    targetA * 0.55,
+    (cellArea(full) * FOCUS_MIN_RATIO) / (focus.length * (FOCUS_MIN_RATIO + perRegion)),
+  )
   const leftover: Rect[] = []
   const focusPlaced = focus.map((photo, index) => {
     const region = regions[Math.min(index, regions.length - 1)]
-    const share = clamp(Math.max(0.64, targetA / Math.max(1, cellArea(region))), 0.64, 0.86)
-    const cut = spanSlice(photo, region, gutter, index + 1, share)
-    if (cut) {
-      if (cut.rest.w > 40 && cut.rest.h > 40) leftover.push(cut.rest)
+    const wanted = Math.min(focusArea, cellArea(region) * 0.62)
+    const cut = bandCut(photo, region, wanted, index, gutter)
+    const bandArea = cut ? cut.box.w * cut.box.h : 0
+    if (
+      cut &&
+      cut.rest.w > 36 &&
+      cut.rest.h > 36 &&
+      bandArea <= wanted * 1.35 &&
+      bandArea >= wanted * 0.62
+    ) {
+      leftover.push(cut.rest)
       return fillCell(photo, cut.box)
     }
-    const fallback = boxForArea(photo, targetA, region.w * 0.9, region.h * 0.86)
+    const { min, max } = legalAspectRange(photo)
+    const aspect = clamp(preferredAspect(photo), min, max)
+    let fh = Math.sqrt(Math.max(wanted, 1) / aspect)
+    let fw = fh * aspect
+    const fit = Math.min(1, (region.w * 0.7) / fw, (region.h * 0.7) / fh)
+    fw *= fit
+    fh *= fit
+    const left = index % 2 === 0
+    const top = index % 4 < 2
     const box = {
-      x: region.x + (index % 2 === 0 ? 0 : Math.max(0, region.w - fallback.w)),
-      y: region.y + (index % 4 < 2 ? 0 : Math.max(0, region.h - fallback.h)),
-      w: fallback.w,
-      h: fallback.h,
+      x: left ? region.x : region.x + region.w - fw,
+      y: top ? region.y : region.y + region.h - fh,
+      w: fw,
+      h: fh,
     }
-    leftover.push(
-      ...freeRects(region, [{ ...box, photoId: photo.id, sx: 0, sy: 0, sw: 1, sh: 1 }], gutter),
-    )
+    const g = Math.max(0, gutter)
+    if (left && region.w - fw - g > 40) {
+      leftover.push({ x: box.x + fw + g, y: box.y, w: region.x + region.w - (box.x + fw + g), h: fh })
+    } else if (!left && box.x - region.x - g > 40) {
+      leftover.push({ x: region.x, y: box.y, w: box.x - region.x - g, h: fh })
+    }
+    if (top && region.h - fh - g > 40) {
+      leftover.push({
+        x: region.x,
+        y: box.y + fh + g,
+        w: region.w,
+        h: region.y + region.h - (box.y + fh + g),
+      })
+    } else if (!top && box.y - region.y - g > 40) {
+      leftover.push({ x: region.x, y: region.y, w: region.w, h: box.y - region.y - g })
+    }
     return fillCell(photo, box)
   })
   if (niche.length === 0) {
@@ -1436,6 +2136,147 @@ function packScattered(
   return gapFill([...focusPlaced, ...nichePlaced], tagged, full, gutter, cap)
 }
 
+function ringOrder(focus: Photo[], niche: Photo[], includeAll: boolean): Photo[] {
+  const pool = includeAll ? niche : niche.slice(0, Math.min(niche.length, Math.max(8, focus.length * 4)))
+  const wide = pool.filter((photo) => preferredAspect(photo) >= 1)
+  const tall = pool.filter((photo) => preferredAspect(photo) < 1)
+  return [...focus, ...wide, ...tall]
+}
+
+function seatFocusOnRing(placed: Placement[], focus: Photo[], photos: Photo[], page: Rect): Placement[] {
+  if (focus.length === 0 || placed.length === 0) return placed
+  const byId = new Map(photos.map((photo) => [photo.id, photo]))
+  const next = placed.map((item) => ({ ...item }))
+  const corners = [
+    { x: page.x, y: page.y },
+    { x: page.x + page.w, y: page.y },
+    { x: page.x + page.w, y: page.y + page.h },
+    { x: page.x, y: page.y + page.h },
+  ]
+  const used = new Set<number>()
+  for (let i = 0; i < focus.length; i++) {
+    const photo = focus[i]
+    const corner = corners[i % corners.length]
+    let best = -1
+    let bestD = Infinity
+    next.forEach((cell, index) => {
+      if (used.has(index) || cell.photoId === photo.id) return
+      const d =
+        (cell.x + cell.w / 2 - corner.x) ** 2 + (cell.y + cell.h / 2 - corner.y) ** 2
+      if (d < bestD) {
+        bestD = d
+        best = index
+      }
+    })
+    const focusIndex = next.findIndex((cell) => cell.photoId === photo.id)
+    if (best < 0 || focusIndex < 0) continue
+    const host = byId.get(next[best].photoId)
+    const focusBox = { x: next[best].x, y: next[best].y, w: next[best].w, h: next[best].h }
+    const otherBox = { x: next[focusIndex].x, y: next[focusIndex].y, w: next[focusIndex].w, h: next[focusIndex].h }
+    if (!host || !fitsAspect(photo, focusBox.w, focusBox.h) || !fitsAspect(host, otherBox.w, otherBox.h)) continue
+    next[best] = fillCell(photo, focusBox)
+    next[focusIndex] = fillCell(host, otherBox)
+    used.add(best)
+  }
+  return next
+}
+
+function rowHeightBand(row: Photo[], width: number, gutter: number): { min: number; max: number } | null {
+  if (row.length === 0) return null
+  const inner = width - Math.max(0, row.length - 1) * gutter
+  if (inner < 16) return null
+  let sumMin = 0
+  let sumMax = 0
+  for (const photo of row) {
+    const range = legalAspectRange(photo)
+    sumMin += range.min
+    sumMax += Math.max(range.min, range.max)
+  }
+  if (sumMax <= 0) return null
+  const min = inner / sumMax
+  const max = inner / Math.max(sumMin, 0.001)
+  if (max + 0.5 < min || min < 8) return null
+  return { min, max: Math.max(min, max) }
+}
+
+function fitBands(bands: { min: number; max: number }[], total: number): number[] | null {
+  let hs = bands.map((band) => clamp(total / bands.length, band.min, band.max))
+  for (let iter = 0; iter < 24; iter++) {
+    const sum = hs.reduce((acc, value) => acc + value, 0)
+    const diff = total - sum
+    if (Math.abs(diff) <= 0.4) return hs
+    let room = 0
+    const slack = hs.map((value, index) => {
+      const space = diff > 0 ? bands[index].max - value : value - bands[index].min
+      const open = Math.max(0, space)
+      room += open
+      return open
+    })
+    if (room <= 0.2) return null
+    const take = Math.min(Math.abs(diff), room)
+    hs = hs.map((value, index) => value + Math.sign(diff) * (slack[index] / room) * take)
+  }
+  return null
+}
+
+function layoutBandRows(
+  rows: Photo[][],
+  heights: number[],
+  region: Rect,
+  gutter: number,
+): Placement[] | null {
+  const placed: Placement[] = []
+  let y = region.y
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r]
+    const last = r === rows.length - 1
+    const h = last ? region.y + region.h - y : heights[r]
+    if (h < 8) return null
+    const inner = region.w - Math.max(0, row.length - 1) * gutter
+    const widths = exactWidths(row, h, inner)
+    if (!widths) return null
+    let x = region.x
+    for (let i = 0; i < row.length; i++) {
+      const w = i === row.length - 1 ? region.x + region.w - x : widths[i]
+      if (w < 8 || !fitsAspect(row[i], w, h)) return null
+      placed.push(fillCell(row[i], { x, y, w, h }))
+      x += w
+      if (i < row.length - 1) x += gutter
+    }
+    y += h
+    if (!last) y += gutter
+  }
+  if (Math.abs(y - (region.y + region.h)) > 1.5) return null
+  return placed
+}
+
+function evenMosaic(photos: Photo[], region: Rect, gutter: number): Placement[] | null {
+  if (photos.length === 0) return null
+  const sorted = [...photos].sort((a, b) => preferredAspect(a) - preferredAspect(b))
+  let best: Placement[] | null = null
+  let bestSpread = Infinity
+  const maxPer = Math.min(12, photos.length)
+  for (let per = 2; per <= maxPer; per++) {
+    const rows: Photo[][] = []
+    for (let i = 0; i < sorted.length; i += per) rows.push(sorted.slice(i, i + per))
+    if (rows.some((row) => row.length === 0)) continue
+    const gaps = Math.max(0, rows.length - 1) * gutter
+    const bands = rows.map((row) => rowHeightBand(row, region.w, gutter))
+    if (bands.some((band) => band == null)) continue
+    const heights = fitBands(bands as { min: number; max: number }[], region.h - gaps)
+    if (!heights) continue
+    const placed = layoutBandRows(rows, heights, region, gutter)
+    if (!placed || placed.length !== photos.length) continue
+    const areas = placed.map(cellArea)
+    const spread = Math.max(...areas) / Math.max(1, Math.min(...areas))
+    if (spread < bestSpread) {
+      bestSpread = spread
+      best = placed
+    }
+  }
+  return best
+}
+
 function packRing(
   focus: Photo[],
   niche: Photo[],
@@ -1444,6 +2285,21 @@ function packRing(
   tagged: Photo[],
   includeAll: boolean,
 ): Placement[] {
+  const pool = includeAll
+    ? [...focus, ...niche]
+    : [...focus, ...niche.slice(0, Math.min(niche.length, Math.max(6, focus.length * 2)))]
+  const mosaic = evenMosaic(pool, full, gutter)
+  if (mosaic && mosaic.length === pool.length) {
+    const holes = leftoverHoles(full, mosaic, gutter).filter(
+      (hole) => Math.min(hole.w, hole.h) > Math.max(gutter, 6),
+    )
+    if (holes.length === 0) return seatFocusOnRing(mosaic, focus, pool, full)
+  }
+  const ordered = ringOrder(focus, niche, includeAll)
+  const packed = slicePack(ordered, full, gutter, includeAll)
+  if (packed.length > focus.length) {
+    return seatFocusOnRing(packed, focus, tagged, full)
+  }
   const n = focus.length
   const targetA = minFocusCellArea(full, n, niche.length, includeAll)
   const cx = full.x + full.w / 2
@@ -1459,7 +2315,6 @@ function packRing(
       ry = Math.min(full.h * 0.42, ry * grow)
     }
   }
-
   let focusPlaced: Placement[] = []
   for (let attempt = 0; attempt < 12; attempt++) {
     focusPlaced = focus.map((photo, index) => {
@@ -1480,8 +2335,38 @@ function packRing(
     ry = Math.min(full.h * 0.44, ry * 1.06)
     if (attempt > 6) size = Math.max(Math.sqrt(targetA) * 0.9, size * 0.92)
   }
-
   return fillLeftovers(niche, focusPlaced, full, gutter, tagged, includeAll)
+}
+
+function centerFocusRows(placed: Placement[], focusIds: Set<string>, page: Rect, gutter: number): Placement[] {
+  const rows: Placement[][] = []
+  for (const cell of [...placed].sort((a, b) => a.y - b.y || a.x - b.x)) {
+    const last = rows[rows.length - 1]
+    if (!last || Math.abs(last[0].y - cell.y) > 2) rows.push([cell])
+    else last.push(cell)
+  }
+  const focusRows = rows.filter((row) => row.some((cell) => focusIds.has(cell.photoId)))
+  const other = rows.filter((row) => !row.some((cell) => focusIds.has(cell.photoId)))
+  const otherH = other.reduce((sum, row) => sum + row[0].h, 0)
+  let above = 0
+  let head = 0
+  for (let i = 0; i < other.length; i++) {
+    if (above + other[i][0].h / 2 >= otherH / 2) {
+      head = i
+      break
+    }
+    above += other[i][0].h
+    head = i + 1
+  }
+  const order = [...other.slice(0, head), ...focusRows, ...other.slice(head)]
+  const out: Placement[] = []
+  let y = page.y
+  order.forEach((row, index) => {
+    for (const cell of row) out.push({ ...cell, y })
+    y += row[0].h
+    if (index < order.length - 1) y += gutter
+  })
+  return out
 }
 
 function packCenter(
@@ -1492,6 +2377,17 @@ function packCenter(
   tagged: Photo[],
   includeAll: boolean,
 ): Placement[] {
+  if (includeAll && focus.length > 0 && niche.length > 0) {
+    const mosaic = evenMosaic([...focus, ...niche], full, gutter)
+    if (mosaic && mosaic.length === focus.length + niche.length) {
+      const holes = leftoverHoles(full, mosaic, gutter).filter(
+        (hole) => Math.min(hole.w, hole.h) > Math.max(gutter, 6),
+      )
+      if (holes.length === 0) {
+        return centerFocusRows(mosaic, new Set(focus.map((photo) => photo.id)), full, gutter)
+      }
+    }
+  }
   const raw = placeFocus(focus, full, gutter, niche.length, includeAll)
   const minY = Math.min(...raw.map((item) => item.y))
   const maxY = Math.max(...raw.map((item) => item.y + item.h))
@@ -1653,8 +2549,13 @@ function coverPage(
     if (progressed) continue
 
     if (remaining.length > 0) {
+      const sizes = placements.map(cellArea).sort((a, b) => a - b)
+      const typical = sizes[Math.floor(sizes.length / 2)] ?? 0
       for (const hole of holes) {
-        const extra = placeIntoHole(remaining, hole, gutter, includeAll, cap)
+        if (!includeAll && typical > 0 && cellArea(hole) < typical * 0.5) continue
+        const extra = placeIntoHole(remaining, hole, gutter, includeAll, cap).filter(
+          (item) => includeAll || typical <= 0 || cellArea(item) >= typical * 0.45,
+        )
         if (extra.length === 0) continue
         placements = [...placements, ...extra]
         remaining = remaining.filter((photo) => !extra.some((item) => item.photoId === photo.id))
@@ -1677,6 +2578,7 @@ function finish(placed: Placement[]): Placement[] {
 }
 
 export function pack(photos: Photo[], page: Page, options: PackOptions): Placement[] {
+  coverMemo.clear()
   const gutter = Math.max(0, options.gutter)
   const breakIndex = Number.isFinite(options.breakIndex) ? options.breakIndex : 0
   const layout: LayoutMode = options.layout ?? 'top'

@@ -12,6 +12,7 @@ type Props = {
   onBreakIndex: (index: number) => void
   includeAll: boolean
   onIncludeAll: (value: boolean) => void
+  onShuffleNiche: () => void
   packedIds: Set<string>
   modifying: boolean
   onDelete: (id: string) => void
@@ -37,6 +38,7 @@ export default function PhotoTray({
   onBreakIndex,
   includeAll,
   onIncludeAll,
+  onShuffleNiche,
   packedIds,
   modifying,
   onDelete,
@@ -47,6 +49,7 @@ export default function PhotoTray({
   const breakRef = useRef(breakIndex)
   const [overKey, setOverKey] = useState<string | null>(null)
   const [insert, setInsert] = useState<InsertPreview | null>(null)
+  const [diceSpin, setDiceSpin] = useState(0)
   breakRef.current = breakIndex
 
   function indexFromPointer(clientY: number): number {
@@ -129,6 +132,12 @@ export default function PhotoTray({
   const focus = photos.slice(0, breakIndex)
   const niche = photos.slice(breakIndex)
   const placing = insert != null
+
+  function shuffleNiche() {
+    setDiceSpin((n) => n + 1)
+    if (niche.length < 2) return
+    onShuffleNiche()
+  }
 
   function renderPhoto(photo: Photo, index: number) {
     const over = overKey === `before:${photo.id}` || overKey === `after:${photo.id}`
@@ -241,8 +250,43 @@ export default function PhotoTray({
         <span className="break-note">Focus above · niche below</span>
       </div>
 
-      <div className="section-row">
+      <div
+        className={`section-row${niche.length < 2 ? ' no-shuffle' : ''}`}
+        onClick={shuffleNiche}
+      >
         <div className="section-label">Niche</div>
+        <button
+          type="button"
+          className="shuffle-niche"
+          aria-label="Shuffle niche photos"
+          title="Shuffle niche photos"
+          disabled={niche.length < 2}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation()
+            shuffleNiche()
+          }}
+        >
+          <span key={diceSpin} className={`dice${diceSpin > 0 ? ' spin' : ''}`}>
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden>
+              <rect
+                x="1.6"
+                y="1.6"
+                width="12.8"
+                height="12.8"
+                rx="2.4"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.4"
+              />
+              <circle cx="5.1" cy="5.1" r="1.05" fill="currentColor" />
+              <circle cx="10.9" cy="5.1" r="1.05" fill="currentColor" />
+              <circle cx="8" cy="8" r="1.05" fill="currentColor" />
+              <circle cx="5.1" cy="10.9" r="1.05" fill="currentColor" />
+              <circle cx="10.9" cy="10.9" r="1.05" fill="currentColor" />
+            </svg>
+          </span>
+        </button>
         <label
           className="inc-all"
           onPointerDown={(event) => event.stopPropagation()}
