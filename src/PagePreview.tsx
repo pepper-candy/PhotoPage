@@ -7,6 +7,10 @@ type Props = {
   placements: Placement[]
   selectedId: string | null
   onSelect: (id: string | null) => void
+  modifying?: boolean
+  starring?: boolean
+  onDelete?: (id: string) => void
+  onStar?: (id: string) => void
 }
 
 function CroppedPhoto({
@@ -14,20 +18,22 @@ function CroppedPhoto({
   placement,
   page,
   selected,
-  onSelect,
+  action,
+  onActivate,
 }: {
   photo: Photo
   placement: Placement
   page: Page
   selected: boolean
-  onSelect: () => void
+  action: 'delete' | 'star' | null
+  onActivate: () => void
 }) {
   const { x, y, w, h, sx, sy, sw, sh } = placement
   const scale = Math.min(w / Math.max(sw, 0.001), h / Math.max(sh, 0.001))
   return (
     <button
       type="button"
-      className={`placed${selected ? ' selected' : ''}`}
+      className={`placed${selected ? ' selected' : ''}${action ? ` ${action}` : ''}`}
       style={{
         left: `${(x / page.width) * 100}%`,
         top: `${(y / page.height) * 100}%`,
@@ -36,9 +42,9 @@ function CroppedPhoto({
       }}
       onClick={(event) => {
         event.stopPropagation()
-        onSelect()
+        onActivate()
       }}
-      title={photo.name}
+      title={action === 'delete' ? `Delete ${photo.name}` : action === 'star' ? `Focus ${photo.name}` : photo.name}
     >
       <img
         src={photo.objectUrl}
@@ -55,19 +61,32 @@ function CroppedPhoto({
   )
 }
 
-export default function PagePreview({ page, photos, placements, selectedId, onSelect }: Props) {
+export default function PagePreview({
+  page,
+  photos,
+  placements,
+  selectedId,
+  onSelect,
+  modifying = false,
+  starring = false,
+  onDelete,
+  onStar,
+}: Props) {
   const byId = new Map(photos.map((photo) => [photo.id, photo]))
+  const action = modifying ? 'delete' : starring ? 'star' : null
 
   return (
     <div
-      className="page"
+      className={`page${action ? ` ${action === 'delete' ? 'modifying' : 'starring'}` : ''}`}
       style={
         {
           '--pw': page.width,
           '--ph': page.height,
         } as CSSProperties
       }
-      onClick={() => onSelect(null)}
+      onClick={() => {
+        if (!action) onSelect(null)
+      }}
     >
       {placements.map((placement) => {
         const photo = byId.get(placement.photoId)
@@ -78,8 +97,13 @@ export default function PagePreview({ page, photos, placements, selectedId, onSe
             photo={photo}
             placement={placement}
             page={page}
-            selected={selectedId === placement.photoId}
-            onSelect={() => onSelect(placement.photoId)}
+            selected={!action && selectedId === placement.photoId}
+            action={action}
+            onActivate={() => {
+              if (modifying) onDelete?.(placement.photoId)
+              else if (starring) onStar?.(placement.photoId)
+              else onSelect(placement.photoId)
+            }}
           />
         )
       })}

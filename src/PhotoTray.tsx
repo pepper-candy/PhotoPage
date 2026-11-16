@@ -15,7 +15,9 @@ type Props = {
   onShuffleNiche: () => void
   packedIds: Set<string>
   modifying: boolean
+  starring: boolean
   onDelete: (id: string) => void
+  onStar: (id: string) => void
 }
 
 type InsertPreview = {
@@ -41,7 +43,9 @@ export default function PhotoTray({
   onShuffleNiche,
   packedIds,
   modifying,
+  starring,
   onDelete,
+  onStar,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null)
   const dragIndex = useRef<number | null>(null)
@@ -146,12 +150,12 @@ export default function PhotoTray({
         key={photo.id}
         data-photo-index={index}
         className={`seq-item${selectedId === photo.id ? ' selected' : ''}${over ? ' over' : ''}${packedIds.has(photo.id) ? '' : ' unused'}`}
-        draggable={!modifying}
+        draggable={!modifying && !starring}
         onPointerDown={() => {
           skipClick.current = false
         }}
         onDragStart={(event) => {
-          if (modifying) {
+          if (modifying || starring) {
             event.preventDefault()
             return
           }
@@ -190,9 +194,15 @@ export default function PhotoTray({
             onDelete(photo.id)
             return
           }
+          if (starring) {
+            onStar(photo.id)
+            return
+          }
           onSelect(selectedId === photo.id ? null : photo.id)
         }}
-        title={modifying ? `Delete ${photo.name}` : photo.name}
+        title={
+          modifying ? `Delete ${photo.name}` : starring ? `Focus ${photo.name}` : photo.name
+        }
       >
         <img src={photo.objectUrl} alt="" draggable={false} />
         <span className="seq-name">{photo.name}</span>
@@ -202,7 +212,7 @@ export default function PhotoTray({
 
   return (
     <div
-      className={`sequence${placing ? ' placing-break' : ''}${modifying ? ' modifying' : ''}`}
+      className={`sequence${placing ? ' placing-break' : ''}${modifying ? ' modifying' : ''}${starring ? ' starring' : ''}`}
       ref={listRef}
       aria-label="Photo sequence"
     >

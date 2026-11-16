@@ -23,10 +23,14 @@ const ACCEPT = 'image/jpeg,image/png,image/webp,image/gif,.jpg,.jpeg,.png,.webp,
 
 const PRESETS = [
   { id: '1:1', label: '1:1', w: 1, h: 1 },
+  { id: '9:16', label: '9:16', w: 9, h: 16 },
   { id: '4:5', label: '4:5', w: 4, h: 5 },
+  { id: '3:4', label: '3:4', w: 3, h: 4 },
   { id: '3:2', label: '3:2', w: 3, h: 2 },
   { id: '4:3', label: '4:3', w: 4, h: 3 },
   { id: '16:9', label: '16:9', w: 16, h: 9 },
+  { id: '2:1', label: '2:1', w: 2, h: 1 },
+  { id: '2.39:1', label: '2.39:1', w: 2.39, h: 1 },
   { id: 'a4', label: 'A4 portrait', w: 1, h: 1.414 },
   { id: 'custom', label: 'Custom', w: 0, h: 0 },
 ] as const
@@ -105,11 +109,12 @@ function App() {
   const [exporting, setExporting] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [modifying, setModifying] = useState(false)
+  const [starring, setStarring] = useState(false)
   const [placements, setPlacements] = useState<Placement[]>([])
   const [packing, setPacking] = useState(false)
   const packId = useRef(0)
 
-  const activePreset = PRESETS.find((item) => item.id === preset) ?? PRESETS[1]
+  const activePreset = PRESETS.find((item) => item.id === preset) ?? PRESETS.find((item) => item.id === '4:5') ?? PRESETS[0]
   const aspectW = preset === 'custom' ? customW : activePreset.w
   const aspectH = preset === 'custom' ? customH : activePreset.h
   const safeW = aspectW > 0 ? aspectW : 1
@@ -192,6 +197,7 @@ function App() {
     setBreakIndex(0)
     setSelectedId(null)
     setModifying(false)
+    setStarring(false)
   }
 
   function deletePhoto(id: string) {
@@ -218,6 +224,12 @@ function App() {
     flags.splice(index, 0, asFocus)
     const cut = flags.indexOf(false)
     commit(next, cut < 0 ? flags.length : cut)
+  }
+
+  function promoteToFocus(id: string) {
+    const from = photos.findIndex((photo) => photo.id === id)
+    if (from < 0 || from < breakIndex) return
+    moveToSection(from, 'focus')
   }
 
   function moveToSection(from: number, section: 'focus' | 'niche') {
@@ -410,12 +422,32 @@ function App() {
           <span className="toolbar-split" aria-hidden />
           <button
             type="button"
+            className={`icon-btn${starring ? ' on starring' : ''}`}
+            aria-label="Add to focus"
+            aria-pressed={starring}
+            title="Click a photo in the sequence or on the page to add it to focus"
+            onClick={() => {
+              setStarring((on) => !on)
+              setModifying(false)
+              setSelectedId(null)
+            }}
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden>
+              <path
+                fill="currentColor"
+                d="M8 1.4 9.9 5.3l4.3.4-3.3 2.9 1 4.2L8 10.8l-3.9 2 1-4.2-3.3-2.9 4.3-.4z"
+              />
+            </svg>
+          </button>
+          <button
+            type="button"
             className={`icon-btn${modifying ? ' on' : ''}`}
             aria-label="Delete photos"
             aria-pressed={modifying}
-            title="Click a photo in the sequence to delete it"
+            title="Click a photo in the sequence or on the page to delete it"
             onClick={() => {
               setModifying((on) => !on)
+              setStarring(false)
               setSelectedId(null)
             }}
           >
@@ -458,7 +490,9 @@ function App() {
           onShuffleNiche={shuffleNiche}
           packedIds={packedIds}
           modifying={modifying}
+          starring={starring}
           onDelete={deletePhoto}
+          onStar={promoteToFocus}
         />
         <div className={selected ? 'stage editing' : 'stage preview'}>
           {selected ? (
@@ -476,6 +510,10 @@ function App() {
               placements={placements}
               selectedId={selectedId}
               onSelect={setSelectedId}
+              modifying={modifying}
+              starring={starring}
+              onDelete={deletePhoto}
+              onStar={promoteToFocus}
             />
           )}
         </div>

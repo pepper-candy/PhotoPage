@@ -47,6 +47,12 @@
   color: #e07070;
 }
 
+.toolbar button.on.starring {
+  border-color: #d4b45a;
+  background: #2a2618;
+  color: #e6c86a;
+}
+
 .toolbar .icon-btn {
   display: inline-flex;
   align-items: center;
@@ -258,6 +264,15 @@
   background: #2a1c1c;
 }
 
+.sequence.starring .seq-item {
+  cursor: pointer;
+}
+
+.sequence.starring .seq-item:hover {
+  border-color: #d4b45a;
+  background: #2a2618;
+}
+
 .seq-item {
   display: grid;
   grid-template-columns: 72px minmax(0, 1fr);
@@ -451,6 +466,16 @@
   outline: 2px solid var(--accent);
   outline-offset: -2px;
   z-index: 1;
+}
+
+.page.modifying .placed:hover {
+  outline: 2px solid #e07070;
+  outline-offset: -2px;
+}
+
+.page.starring .placed:hover {
+  outline: 2px solid #d4b45a;
+  outline-offset: -2px;
 }
 
 .placed img {
