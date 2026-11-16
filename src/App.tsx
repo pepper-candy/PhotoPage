@@ -592,6 +592,9 @@ function App() {
               placements={placements}
               selectedId={selectedId}
               onSelect={setSelectedId}
+              onPlacements={setPlacements}
+              gutter={gutter}
+              packing={packing}
               modifying={modifying}
               starring={starring}
               onDelete={deletePhoto}

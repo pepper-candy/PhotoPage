@@ -519,6 +519,7 @@ function gapFill(
   gutter: number,
   nicheCap?: number,
   passes = GAP_PASSES,
+  expandFocus = true,
 ): Placement[] {
   const byId = new Map(photos.map((photo) => [photo.id, photo]))
   const order = new Map(photos.map((photo, index) => [photo.id, index]))
@@ -532,6 +533,7 @@ function gapFill(
     for (const placement of placements) {
       const photo = byId.get(placement.photoId)
       if (!photo) continue
+      if (!expandFocus && photo.group === 'focus') continue
       let best: { dir: Dir; area: number } | null = null
       for (const dir of dirs) {
         const candidate = tryExpand(placement, dir, placements, photo, region, gutter, capOf(photo))
@@ -1618,13 +1620,32 @@ function splitByArea(photos: Photo[], rects: Rect[]): Photo[][] {
   return groups
 }
 
+function placeFeatured(photo: Photo, page: Rect, gutter: number, anchor: 'top' | 'center'): Placement {
+  const g = Math.max(0, gutter)
+  const short = Math.min(page.w, page.h)
+  const inset = Math.max(g + 64, short * 0.2)
+  const maxW = Math.max(64, page.w - 2 * inset)
+  const maxH =
+    anchor === 'center'
+      ? Math.max(64, page.h - 2 * inset)
+      : Math.max(64, page.h * 0.62)
+  const { w, h } = fitSize(photo, maxW, maxH)
+  const x = page.x + (page.w - w) / 2
+  const y = anchor === 'center' ? page.y + (page.h - h) / 2 : page.y
+  return fillCell(photo, { x, y, w, h })
+}
+
 function placeFocus(
   focus: Photo[],
   page: Rect,
   gutter: number,
   nicheCount: number,
   includeAll: boolean,
+  anchor: 'top' | 'center' = 'top',
 ): Placement[] {
+  if (focus.length === 1 && nicheCount > 0) {
+    return [placeFeatured(focus[0], page, gutter, anchor)]
+  }
   const targetA = minFocusCellArea(page, focus.length, nicheCount, includeAll)
   const { focusH, focusCap } = planFocus(page.h, gutter, focus.length, Math.max(1, nicheCount))
   const cols = Math.max(1, Math.round(Math.sqrt(focus.length)))
@@ -1691,7 +1712,19 @@ function packTopMixed(
   const cap = nicheAreaCap(focusPlaced)
   const rects = sideAndBottom(full, focusPlaced, gutter)
   const nichePlaced = packNicheRects(niche, rects, gutter, includeAll, cap)
-  return gapFill([...focusPlaced, ...nichePlaced], tagged, full, gutter, cap)
+  const combined = [...focusPlaced, ...nichePlaced]
+  const used = new Set(combined.map((item) => item.photoId))
+  const leftover = niche.filter((photo) => !used.has(photo.id))
+  const focusIds = new Set(focus.map((photo) => photo.id))
+  return gapFill(
+    combined,
+    tagged,
+    full,
+    gutter,
+    cap,
+    GAP_PASSES,
+    canGrowFocus(combined, leftover, focusIds),
+  )
 }
 
 function flipY(placements: Placement[], pageH: number): Placement[] {
@@ -1749,11 +1782,31 @@ function fillLeftovers(
   const rects = freeRects(page, occupied, gutter)
     .filter((rect) => rect.w > 48 && rect.h > 36)
     .sort((a, b) => a.y - b.y || a.x - b.x)
+  const focusIds = new Set(occupied.map((item) => item.photoId))
   if (rects.length === 0 || niche.length === 0) {
-    return gapFill(occupied, tagged, page, gutter, cap)
+    return gapFill(
+      occupied,
+      tagged,
+      page,
+      gutter,
+      cap,
+      GAP_PASSES,
+      canGrowFocus(occupied, niche, focusIds),
+    )
   }
   const nichePlaced = packNicheRects(niche, rects, gutter, includeAll, cap)
-  return gapFill([...occupied, ...nichePlaced], tagged, page, gutter, cap)
+  const combined = [...occupied, ...nichePlaced]
+  const used = new Set(combined.map((item) => item.photoId))
+  const leftover = niche.filter((photo) => !used.has(photo.id))
+  return gapFill(
+    combined,
+    tagged,
+    page,
+    gutter,
+    cap,
+    GAP_PASSES,
+    canGrowFocus(combined, leftover, focusIds),
+  )
 }
 
 function ringOrder(focus: Photo[], niche: Photo[], includeAll: boolean): Photo[] {
@@ -1997,7 +2050,7 @@ function packCenter(
   tagged: Photo[],
   includeAll: boolean,
 ): Placement[] {
-  if (includeAll && focus.length > 0 && niche.length > 0) {
+  if (includeAll && focus.length > 1 && niche.length > 0) {
     const mosaic = evenMosaic([...focus, ...niche], full, gutter)
     if (mosaic && mosaic.length === focus.length + niche.length) {
       const holes = leftoverHoles(full, mosaic, gutter).filter(
@@ -2008,7 +2061,10 @@ function packCenter(
       }
     }
   }
-  const raw = placeFocus(focus, full, gutter, niche.length, includeAll)
+  const raw = placeFocus(focus, full, gutter, niche.length, includeAll, 'center')
+  if (focus.length === 1 && niche.length > 0) {
+    return fillLeftovers(niche, raw, full, gutter, tagged, includeAll)
+  }
   const minY = Math.min(...raw.map((item) => item.y))
   const maxY = Math.max(...raw.map((item) => item.y + item.h))
   const dy = full.y + full.h / 2 - (minY + maxY) / 2
@@ -2113,6 +2169,13 @@ function placeIntoHole(
   return slicePack(remaining, parts[1], gutter, includeAll, maxArea)
 }
 
+function canGrowFocus(placements: Placement[], remaining: Photo[], focusIds: Set<string>): boolean {
+  if (remaining.length > 0) return false
+  const nichesOnPage = placements.some((item) => !focusIds.has(item.photoId))
+  const focusOnPage = placements.reduce((count, item) => count + (focusIds.has(item.photoId) ? 1 : 0), 0)
+  return !(focusOnPage === 1 && nichesOnPage)
+}
+
 function coverPage(
   placed: Placement[],
   tagged: Photo[],
@@ -2128,7 +2191,8 @@ function coverPage(
 
   for (let pass = 0; pass < 80; pass++) {
     const cap = nicheAreaCap(placements.filter((item) => focusIds.has(item.photoId)))
-    placements = gapFill(placements, tagged, page, gutter, cap, 6)
+    const growFocus = canGrowFocus(placements, remaining, focusIds)
+    placements = gapFill(placements, tagged, page, gutter, cap, 6, growFocus)
 
     const holes = leftoverHoles(page, placements, gutter)
     if (holes.length === 0) break
@@ -2138,6 +2202,7 @@ function coverPage(
       const neighbors = placements
         .map((item, index) => ({ item, index, side: edgeSide(item, hole, gutter) }))
         .filter((entry) => entry.side)
+        .filter((entry) => growFocus || !focusIds.has(entry.item.photoId))
         .sort((a, b) => {
           const af = Number(focusIds.has(a.item.photoId))
           const bf = Number(focusIds.has(b.item.photoId))
@@ -2169,8 +2234,12 @@ function coverPage(
     if (progressed) continue
 
     if (remaining.length > 0) {
-      const sizes = placements.map(cellArea).sort((a, b) => a - b)
-      const typical = sizes[Math.floor(sizes.length / 2)] ?? 0
+      const nicheSizes = placements
+        .filter((item) => !focusIds.has(item.photoId))
+        .map(cellArea)
+        .sort((a, b) => a - b)
+      const typical =
+        nicheSizes[Math.floor(nicheSizes.length / 2)] ?? healthyArea(page)
       for (const hole of holes) {
         if (!includeAll && typical > 0 && cellArea(hole) < typical * 0.5) continue
         const extra = placeIntoHole(remaining, hole, gutter, includeAll, cap).filter(
@@ -2188,7 +2257,15 @@ function coverPage(
   }
 
   const cap = nicheAreaCap(placements.filter((item) => focusIds.has(item.photoId)))
-  return gapFill(placements, tagged, page, gutter, cap, 10)
+  return gapFill(
+    placements,
+    tagged,
+    page,
+    gutter,
+    cap,
+    10,
+    canGrowFocus(placements, remaining, focusIds),
+  )
 }
 
 function finish(placed: Placement[]): Placement[] {
