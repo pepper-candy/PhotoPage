@@ -3482,13 +3482,14 @@ function applyGrowCascade(
   gutter: number,
   maxArea: number | undefined,
   depth: number,
+  slideNiches = false,
 ): Placement[] | null {
   if (depth > 8) return null
   const g = Math.max(0, gutter)
   const grower = placed.find((item) => item.photoId === job.item.photoId)
   if (!grower) return null
   const canMove = (id: string) =>
-    photo.group !== 'focus' && byId.get(id)?.group !== 'focus'
+    (slideNiches || photo.group !== 'focus') && byId.get(id)?.group !== 'focus'
   const neighbors = settleHoleNeighbors(job.hole, placed, g)
   const clipped = clipHoleToContacts(
     clipHoleToJog(job.hole, grower, job.side, neighbors),
@@ -3577,12 +3578,30 @@ function fillVacatedStrip(
   for (const entry of neighbors) {
     const photo = byId.get(entry.item.photoId)
     if (!photo || photo.group === 'focus') continue
-    const cap =
+    const job: GrowJob = { item: entry.item, side: growSide, hole: strip }
+    const proposed = growBoxToward(entry.item, strip, growSide, photo, region, undefined)
+    const holeArea = proposed ? cellArea(proposed) : undefined
+    const hardCap =
       photo.group === 'focus'
         ? undefined
         : nicheAreaCap(next.filter((item) => byId.get(item.photoId)?.group === 'focus'))
-    const job: GrowJob = { item: entry.item, side: growSide, hole: strip }
-    const applied = applyGrowCascade(job, next, photo, byId, region, g, cap, depth + 1)
+    let applied = applyGrowCascade(job, next, photo, byId, region, g, hardCap, depth + 1)
+    const modestJog =
+      holeArea != null &&
+      growSpan(growSide, strip) <= Math.max(80, Math.min(entry.item.w, entry.item.h) * 0.55)
+    if (!applied && photo.group !== 'focus' && holeArea != null && modestJog) {
+      next = liftFocusCap(next, byId, region, g, holeArea)
+      const liftedCap = nicheAreaCap(next.filter((item) => byId.get(item.photoId)?.group === 'focus'))
+      applied = applyGrowCascade(job, next, photo, byId, region, g, liftedCap, depth + 1)
+      if (!applied) {
+        applied = applyGrowCascade(job, next, photo, byId, region, g, holeArea, depth + 1)
+      }
+    }
+    if (applied && !ratioHolds(applied, byId)) {
+      const grown = applied.find((item) => item.photoId === entry.item.photoId) ?? entry.item
+      applied = liftFocusCap(applied, byId, region, g, cellArea(grown))
+      if (!ratioHolds(applied, byId) && !nichesStaySmaller(applied, byId)) applied = null
+    }
     if (applied) {
       next = applied
       break
@@ -3601,26 +3620,66 @@ function liftFocusCap(
   let next = placed
   const needMin = neededNicheArea * FOCUS_MIN_RATIO
   const g = Math.max(0, gutter)
-  for (let k = 0; k < 4; k++) {
-    const focusPlaced = next.filter((item) => byId.get(item.photoId)?.group === 'focus')
-    if (focusPlaced.length === 0) return next
-    const smallest = focusPlaced.slice().sort((a, b) => cellArea(a) - cellArea(b))[0]
-    if (cellArea(smallest) >= needMin - 1) return next
-    const photo = byId.get(smallest.photoId)
-    if (!photo) return next
-    let best: { extra: number; next: Placement } | null = null
-    for (const dir of ['right', 'left', 'down', 'up'] as Dir[]) {
-      const slack = sideExtra(smallest, next, dir, g)
-      if (slack == null || slack <= 0.75) continue
-      const grown = tryExpand(smallest, dir, next, photo, region, g, needMin)
-      if (!grown || grown.area < 0.75 || !inRegion(grown.next, region)) continue
-      if (!best || grown.area < best.extra) best = { extra: grown.area, next: grown.next }
+  const dirs: Dir[] = ['right', 'left', 'down', 'up']
+  const growOnce = (start: Placement[], item: Placement, photo: Photo): Placement[] | null => {
+    const current = start.find((entry) => entry.photoId === item.photoId) ?? item
+    let best: Placement[] | null = null
+    let bestArea = cellArea(current)
+    const consider = (applied: Placement[] | null) => {
+      if (!applied) return
+      const grown = applied.find((entry) => entry.photoId === current.photoId)
+      if (!grown || cellArea(grown) <= bestArea + 0.75) return
+      best = applied
+      bestArea = cellArea(grown)
     }
-    if (!best) break
-    next = replacePlacement(next, best.next)
+    for (const dir of dirs) {
+      const grown = tryExpand(current, dir, start, photo, region, g, needMin)
+      if (grown && grown.area >= 0.75 && inRegion(grown.next, region)) {
+        consider(replacePlacement(start, grown.next))
+      }
+    }
+    if (!best) return null
+    if (bestArea >= needMin - 1) return best
+    const midItem = best.find((entry) => entry.photoId === current.photoId)
+    if (!midItem) return best
+    let best2 = best
+    let best2Area = bestArea
+    for (const dir of dirs) {
+      const grown = tryExpand(midItem, dir, best, photo, region, g, needMin)
+      if (grown && grown.area >= 0.75 && inRegion(grown.next, region) && cellArea(grown.next) > best2Area + 0.75) {
+        best2 = replacePlacement(best, grown.next)
+        best2Area = cellArea(grown.next)
+      }
+    }
+    return best2
+  }
+  for (let k = 0; k < 8; k++) {
+    const short = next
+      .filter((item) => byId.get(item.photoId)?.group === 'focus' && cellArea(item) < needMin - 1)
+      .sort((a, b) => cellArea(a) - cellArea(b))
+    if (short.length === 0) return next
+    let progressed = false
+    for (const item of short) {
+      const photo = byId.get(item.photoId)
+      if (!photo) continue
+      const lifted = growOnce(next, item, photo)
+      if (!lifted) continue
+      next = lifted
+      progressed = true
+      break
+    }
+    if (!progressed) break
   }
   return next
 }
+
+function nichesStaySmaller(placed: Placement[], byId: Map<string, Photo>): boolean {
+  const focus = placed.filter((item) => byId.get(item.photoId)?.group === 'focus')
+  const niche = placed.filter((item) => byId.get(item.photoId)?.group === 'niche')
+  if (focus.length === 0 || niche.length === 0) return true
+  return Math.min(...focus.map(cellArea)) + 1 >= Math.max(...niche.map(cellArea)) * 1.25
+}
+
 
 function settleExpandPass(
   placed: Placement[],
@@ -3644,21 +3703,36 @@ function settleExpandPass(
     const photo = byId.get(current.photoId)
     if (!photo) return false
     if (photo.group === 'focus' && !allowFocus) return false
+    const tryApply = (cap: number | undefined): Placement[] | null => {
+      const start = next.find((item) => item.photoId === current.photoId) ?? current
+      return applyGrowCascade({ ...job, item: start }, next, photo, byId, region, g, cap, 0)
+    }
+    const proposed = photo.group === 'focus'
+      ? null
+      : growBoxToward(current, job.hole, job.side, photo, region, undefined)
+    const holeArea = proposed
+      ? cellArea(proposed)
+      : cellArea(current) + growSpan(job.side, job.hole) * (
+          job.side === 'left' || job.side === 'right' ? current.h : current.w
+        )
+    const jog = growSpan(job.side, job.hole)
+    const modestJog = jog <= Math.max(80, Math.min(current.w, current.h) * 0.55)
     let cap = liveCap(photo)
-    const fresh = { ...job, item: current }
-    let applied = applyGrowCascade(fresh, next, photo, byId, region, g, cap, 0)
-    if (!applied && photo.group !== 'focus') {
-      const proposed = growBoxToward(current, job.hole, job.side, photo, region, undefined)
-      if (proposed) next = liftFocusCap(next, byId, region, g, cellArea(proposed))
+    let applied = tryApply(cap)
+    if (!applied && photo.group !== 'focus' && modestJog) {
+      next = liftFocusCap(next, byId, region, g, holeArea)
       cap = liveCap(photo)
-      const retry = { ...job, item: next.find((item) => item.photoId === current.photoId) ?? current }
-      applied = applyGrowCascade(retry, next, photo, byId, region, g, cap, 0)
+      applied = tryApply(cap)
+    }
+    if (!applied && photo.group !== 'focus' && modestJog) {
+      next = liftFocusCap(next, byId, region, g, holeArea)
+      applied = tryApply(holeArea)
     }
     if (!applied) return false
     if (!ratioHolds(applied, byId)) {
       const grown = applied.find((item) => item.photoId === current.photoId) ?? current
       applied = liftFocusCap(applied, byId, region, g, cellArea(grown))
-      if (!ratioHolds(applied, byId)) return false
+      if (!ratioHolds(applied, byId) && !nichesStaySmaller(applied, byId)) return false
     }
     next = applied
     return true
