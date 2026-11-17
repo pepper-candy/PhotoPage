@@ -3018,9 +3018,11 @@ function bestSlideFor(
     }
     for (const hit of hits) {
       if (dir === 'right' || dir === 'left') {
+        if (hit.other.h + 8 < item.h) continue
         consider(0, hit.other.y - item.y)
         consider(0, hit.other.y + hit.other.h - (item.y + item.h))
       } else {
+        if (hit.other.w + 8 < item.w) continue
         consider(hit.other.x - item.x, 0)
         consider(hit.other.x + hit.other.w - (item.x + item.w), 0)
       }
@@ -3146,6 +3148,48 @@ function lerpGrowHole(placement: Placement, hole: Rect, side: Dir, t: number): R
   return { ...hole, y, h: hole.y + hole.h - y }
 }
 
+function growBoxToward(
+  placement: Placement,
+  hole: Rect,
+  side: Dir,
+  photo: Photo,
+  region: Rect,
+  maxArea?: number,
+): Placement | null {
+  const { min: aMin, max: aMax } = legalAspectRange(photo)
+  const areaLimit = maxArea != null && Number.isFinite(maxArea) ? maxArea : Number.POSITIVE_INFINITY
+  let x = placement.x
+  let y = placement.y
+  let w = placement.w
+  let h = placement.h
+  if (side === 'right' || side === 'left') {
+    const limitW = Math.min(aMax * h, areaLimit / Math.max(h, 0.001), region.x + region.w - (side === 'right' ? x : region.x))
+    if (side === 'right') {
+      w = Math.min(Math.max(w, hole.x + hole.w - x), limitW, region.x + region.w - x)
+    } else {
+      w = Math.min(Math.max(w, x + w - hole.x), limitW, x + w - region.x)
+      x = placement.x + placement.w - w
+    }
+  } else {
+    const limitH = Math.min(
+      w / Math.max(aMin, 0.001),
+      areaLimit / Math.max(w, 0.001),
+      side === 'down' ? region.y + region.h - y : y + h - region.y,
+    )
+    if (side === 'down') {
+      h = Math.min(Math.max(h, hole.y + hole.h - y), limitH, region.y + region.h - y)
+    } else {
+      h = Math.min(Math.max(h, y + h - hole.y), limitH, y + h - region.y)
+      y = placement.y + placement.h - h
+    }
+  }
+  if (w <= placement.w + EPS && h <= placement.h + EPS) return null
+  if (!inRegion({ x, y, w, h }, region)) return null
+  const next = fillCell(photo, { x, y, w, h })
+  if (cellArea(next) <= cellArea(placement) + EPS) return null
+  return next
+}
+
 function growTowardLegal(
   placement: Placement,
   hole: Rect,
@@ -3181,6 +3225,98 @@ function growTowardLegal(
     }
   }
   return best
+}
+
+function inGrowPath(blocker: Placement, grower: Placement, side: Dir): boolean {
+  if (side === 'left') return blocker.x + blocker.w <= grower.x + EPS
+  if (side === 'right') return blocker.x >= grower.x + grower.w - EPS
+  if (side === 'up') return blocker.y + blocker.h <= grower.y + EPS
+  return blocker.y >= grower.y + grower.h - EPS
+}
+
+function coversGrower(other: Placement, grower: Placement, side: Dir): boolean {
+  if (side === 'left' || side === 'right') {
+    return rangeOverlap(other.y, other.y + other.h, grower.y, grower.y + grower.h) >= grower.h - 8
+  }
+  return rangeOverlap(other.x, other.x + other.w, grower.x, grower.x + grower.w) >= grower.w - 8
+}
+
+function clipHoleToContacts(
+  hole: Rect,
+  grower: Placement,
+  side: Dir,
+  placed: Placement[],
+  gutter: number,
+): Rect {
+  const g = Math.max(0, gutter)
+  let x0 = hole.x
+  let y0 = hole.y
+  let x1 = hole.x + hole.w
+  let y1 = hole.y + hole.h
+  for (const other of placed) {
+    if (other.photoId === grower.photoId) continue
+    if (!coversGrower(other, grower, side)) continue
+    if (side === 'right') {
+      if (other.x >= grower.x + grower.w - EPS) x1 = Math.min(x1, other.x - g)
+    } else if (side === 'left') {
+      if (other.x + other.w <= grower.x + EPS) x0 = Math.max(x0, other.x + other.w + g)
+    } else if (side === 'down') {
+      if (other.y >= grower.y + grower.h - EPS) y1 = Math.min(y1, other.y - g)
+    } else if (other.y + other.h <= grower.y + EPS) {
+      y0 = Math.max(y0, other.y + other.h + g)
+    }
+  }
+  return { x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) }
+}
+
+function holeAbuts(item: Placement, side: Dir, hole: Rect, gutter: number): boolean {
+  const g = Math.max(0, gutter)
+  const contact =
+    side === 'left' || side === 'right'
+      ? rangeOverlap(item.y, item.y + item.h, hole.y, hole.y + hole.h)
+      : rangeOverlap(item.x, item.x + item.w, hole.x, hole.x + hole.w)
+  if (contact <= 8) return false
+  if (side === 'left') return Math.abs(hole.x + hole.w - item.x) <= g + 2
+  if (side === 'right') return Math.abs(hole.x - (item.x + item.w)) <= g + 2
+  if (side === 'up') return Math.abs(hole.y + hole.h - item.y) <= g + 2
+  return Math.abs(hole.y - (item.y + item.h)) <= g + 2
+}
+
+function growSpan(side: Dir, hole: Rect): number {
+  return side === 'left' || side === 'right' ? hole.w : hole.h
+}
+
+function indentIsJog(indent: Rect, placed: Placement[], growerId: string): boolean {
+  for (const item of placed) {
+    if (item.photoId === growerId) continue
+    const ow = rangeOverlap(indent.x, indent.x + indent.w, item.x, item.x + item.w)
+    const oh = rangeOverlap(indent.y, indent.y + indent.h, item.y, item.y + item.h)
+    if (ow <= 8 || oh <= 8) continue
+    if (ow >= item.w - 8 && oh >= item.h - 8) return false
+  }
+  return true
+}
+
+function ratioHolds(placed: Placement[], byId: Map<string, Photo>): boolean {
+  const focus = placed.filter((item) => byId.get(item.photoId)?.group === 'focus')
+  const niche = placed.filter((item) => byId.get(item.photoId)?.group === 'niche')
+  if (focus.length === 0 || niche.length === 0) return true
+  return Math.min(...focus.map(cellArea)) + 1 >= Math.max(...niche.map(cellArea)) * FOCUS_MIN_RATIO
+}
+
+function slideNeed(blocker: Placement, grown: Rect, side: Dir, gutter: number): number {
+  const g = Math.max(0, gutter)
+  if (side === 'left') return blocker.x + blocker.w + g - grown.x
+  if (side === 'right') return grown.x + grown.w + g - blocker.x
+  if (side === 'up') return blocker.y + blocker.h + g - grown.y
+  return grown.y + grown.h + g - blocker.y
+}
+
+function deltaForSide(side: Dir, amount: number): { dx: number; dy: number } {
+  if (side === 'left') return { dx: -amount, dy: 0 }
+  if (side === 'right') return { dx: amount, dy: 0 }
+  if (side === 'up') return { dx: 0, dy: -amount }
+  return { dx: 0, dy: amount }
 }
 
 function tJunctionHoles(placed: Placement[], gutter: number, region: Rect): Rect[] {
@@ -3234,6 +3370,258 @@ function tJunctionHoles(placed: Placement[], gutter: number, region: Rect): Rect
   return out
 }
 
+type GrowJob = { item: Placement; side: Dir; hole: Rect }
+
+function alignJobs(placed: Placement[], gutter: number): GrowJob[] {
+  const g = Math.max(0, gutter)
+  const jobs: GrowJob[] = []
+  const add = (item: Placement, side: Dir, hole: Rect, stacked = false) => {
+    if (hole.w <= g + 1 && (side === 'left' || side === 'right')) return
+    if (hole.h <= g + 1 && (side === 'up' || side === 'down')) return
+    if (hole.w <= 1 || hole.h <= 1) return
+    if (stacked && !indentIsJog(hole, placed, item.photoId)) return
+    const clipped = clipHoleToContacts(hole, item, side, placed, g)
+    if (!holeAbuts(item, side, clipped, g)) return
+    if (clipped.w <= g + 1 && (side === 'left' || side === 'right')) return
+    if (clipped.h <= g + 1 && (side === 'up' || side === 'down')) return
+    const prev = jobs.find((job) => job.item.photoId === item.photoId && job.side === side)
+    if (prev) {
+      const span = growSpan(side, clipped)
+      const prevSpan = growSpan(side, prev.hole)
+      const contact = holeEdgeContact(item, clipped, side)
+      const prevContact = holeEdgeContact(item, prev.hole, side)
+      if (span + 1 < prevSpan || (Math.abs(span - prevSpan) <= 8 && contact > prevContact + 8)) prev.hole = clipped
+      return
+    }
+    jobs.push({ item, side, hole: clipped })
+  }
+  for (const a of placed) {
+    for (const b of placed) {
+      if (a.photoId === b.photoId) continue
+      const xOv = rangeOverlap(a.x, a.x + a.w, b.x, b.x + b.w)
+      const yOv = rangeOverlap(a.y, a.y + a.h, b.y, b.y + b.h)
+      const yGapDown = b.y - (a.y + a.h)
+      const yGapUp = a.y - (b.y + b.h)
+      const xGapRight = b.x - (a.x + a.w)
+      const xGapLeft = a.x - (b.x + b.w)
+      if (xOv > 8 && yGapDown >= -EPS && yGapDown <= g + 8) {
+        if (a.x > b.x + g + 1) add(a, 'left', { x: b.x, y: a.y, w: a.x - b.x, h: a.h }, true)
+        if (a.x + a.w + g + 1 < b.x + b.w) add(a, 'right', { x: a.x + a.w, y: a.y, w: b.x + b.w - (a.x + a.w), h: a.h }, true)
+      }
+      if (xOv > 8 && yGapUp >= -EPS && yGapUp <= g + 8) {
+        if (a.x > b.x + g + 1) add(a, 'left', { x: b.x, y: a.y, w: a.x - b.x, h: a.h }, true)
+        if (a.x + a.w + g + 1 < b.x + b.w) add(a, 'right', { x: a.x + a.w, y: a.y, w: b.x + b.w - (a.x + a.w), h: a.h }, true)
+      }
+      if (yOv > 8 && xGapRight >= -EPS && xGapRight <= g + 8) {
+        if (a.y > b.y + g + 1) add(a, 'up', { x: a.x, y: b.y, w: a.w, h: a.y - b.y }, true)
+        if (a.y + a.h + g + 1 < b.y + b.h) add(a, 'down', { x: a.x, y: a.y + a.h, w: a.w, h: b.y + b.h - (a.y + a.h) }, true)
+      }
+      if (yOv > 8 && xGapLeft >= -EPS && xGapLeft <= g + 8) {
+        if (a.y > b.y + g + 1) add(a, 'up', { x: a.x, y: b.y, w: a.w, h: a.y - b.y }, true)
+        if (a.y + a.h + g + 1 < b.y + b.h) add(a, 'down', { x: a.x, y: a.y + a.h, w: a.w, h: b.y + b.h - (a.y + a.h) }, true)
+      }
+    }
+  }
+  return jobs
+}
+
+function cascadeSlide(
+  item: Placement,
+  side: Dir,
+  amount: number,
+  placed: Placement[],
+  gutter: number,
+  region: Rect,
+  moving: Set<string>,
+  slid: { old: Placement; neu: Placement }[],
+  canMove: (id: string) => boolean,
+): Placement[] | null {
+  if (amount <= 0.5) return placed
+  if (moving.has(item.photoId) || !canMove(item.photoId)) return null
+  const current = placed.find((entry) => entry.photoId === item.photoId) ?? item
+  const { dx, dy } = deltaForSide(side, amount)
+  const shifted = shiftedPlacement(current, dx, dy)
+  if (!inRegion(shifted, region)) return null
+  moving.add(current.photoId)
+  let next = placed
+  const blockers = next.filter(
+    (other) => other.photoId !== current.photoId && boxesOverlap(shifted, other, gutter),
+  )
+  for (const blocker of blockers) {
+    const need = slideNeed(blocker, shifted, side, gutter)
+    if (need <= 0.5) continue
+    const cascaded = cascadeSlide(blocker, side, need, next, gutter, region, moving, slid, canMove)
+    if (!cascaded) return null
+    next = cascaded
+  }
+  const others = next.filter((other) => other.photoId !== current.photoId)
+  if (collide(shifted, others, gutter)) return null
+  slid.push({ old: current, neu: shifted })
+  return replacePlacement(next, shifted)
+}
+
+function vacatedStrip(oldItem: Placement, neu: Placement, side: Dir): Rect {
+  if (side === 'left') {
+    return { x: neu.x + neu.w, y: neu.y, w: oldItem.x + oldItem.w - (neu.x + neu.w), h: neu.h }
+  }
+  if (side === 'right') {
+    return { x: oldItem.x, y: neu.y, w: neu.x - oldItem.x, h: neu.h }
+  }
+  if (side === 'up') {
+    return { x: neu.x, y: neu.y + neu.h, w: neu.w, h: oldItem.y + oldItem.h - (neu.y + neu.h) }
+  }
+  return { x: neu.x, y: oldItem.y, w: neu.w, h: neu.y - oldItem.y }
+}
+
+function applyGrowCascade(
+  job: GrowJob,
+  placed: Placement[],
+  photo: Photo,
+  byId: Map<string, Photo>,
+  region: Rect,
+  gutter: number,
+  maxArea: number | undefined,
+  depth: number,
+): Placement[] | null {
+  if (depth > 8) return null
+  const g = Math.max(0, gutter)
+  const grower = placed.find((item) => item.photoId === job.item.photoId)
+  if (!grower) return null
+  const canMove = (id: string) =>
+    photo.group !== 'focus' && byId.get(id)?.group !== 'focus'
+  const neighbors = settleHoleNeighbors(job.hole, placed, g)
+  const clipped = clipHoleToContacts(
+    clipHoleToJog(job.hole, grower, job.side, neighbors),
+    grower,
+    job.side,
+    placed,
+    g,
+  )
+  const target = clipped
+
+  const attempt = (grown: Placement): Placement[] | null => {
+    const blockers = placed.filter(
+      (other) =>
+        other.photoId !== grower.photoId &&
+        boxesOverlap(grown, other, g) &&
+        inGrowPath(other, grower, job.side) &&
+        !coversGrower(other, grower, job.side),
+    )
+    const moving = new Set<string>([grower.photoId])
+    const slid: { old: Placement; neu: Placement }[] = []
+    let next = placed
+    for (const blocker of blockers) {
+      const currentBlocker = next.find((item) => item.photoId === blocker.photoId) ?? blocker
+      const need = slideNeed(currentBlocker, grown, job.side, g)
+      if (need <= 0.5) continue
+      const cascaded = cascadeSlide(currentBlocker, job.side, need, next, g, region, moving, slid, canMove)
+      if (!cascaded) return null
+      next = cascaded
+    }
+    const others = next.filter((item) => item.photoId !== grower.photoId)
+    if (collide(grown, others, g) || !inRegion(grown, region)) return null
+    next = replacePlacement(next, grown)
+    for (const entry of slid) {
+      const strip = vacatedStrip(entry.old, entry.neu, job.side)
+      if (Math.min(strip.w, strip.h) <= g + 1) continue
+      next = fillVacatedStrip(next, strip, entry.neu, job.side, photo, byId, region, g, depth + 1)
+    }
+    return next
+  }
+
+  const full = growBoxToward(grower, target, job.side, photo, region, maxArea)
+  if (full) {
+    const applied = attempt(full)
+    if (applied) return applied
+  }
+  let lo = 0
+  let hi = 1
+  let best: Placement[] | null = null
+  for (let i = 0; i < 12; i++) {
+    const mid = (lo + hi) / 2
+    const grown = growBoxToward(grower, lerpGrowHole(grower, target, job.side, mid), job.side, photo, region, maxArea)
+    if (!grown) {
+      hi = mid
+      continue
+    }
+    const applied = attempt(grown)
+    if (applied) {
+      best = applied
+      lo = mid
+    } else {
+      hi = mid
+    }
+  }
+  return best
+}
+
+function fillVacatedStrip(
+  placed: Placement[],
+  strip: Rect,
+  slid: Placement,
+  slideDir: Dir,
+  _photo: Photo,
+  byId: Map<string, Photo>,
+  region: Rect,
+  gutter: number,
+  depth: number,
+): Placement[] {
+  if (depth > 8) return placed
+  const g = Math.max(0, gutter)
+  if (Math.min(strip.w, strip.h) <= g + 1) return placed
+  const growSide = slideDir
+  const neighbors = settleHoleNeighbors(strip, placed, g)
+    .filter((entry) => entry.item.photoId !== slid.photoId && entry.side === oppositeDir(growSide))
+    .sort((a, b) => b.contact - a.contact)
+  let next = placed
+  for (const entry of neighbors) {
+    const photo = byId.get(entry.item.photoId)
+    if (!photo || photo.group === 'focus') continue
+    const cap =
+      photo.group === 'focus'
+        ? undefined
+        : nicheAreaCap(next.filter((item) => byId.get(item.photoId)?.group === 'focus'))
+    const job: GrowJob = { item: entry.item, side: growSide, hole: strip }
+    const applied = applyGrowCascade(job, next, photo, byId, region, g, cap, depth + 1)
+    if (applied) {
+      next = applied
+      break
+    }
+  }
+  return next
+}
+
+function liftFocusCap(
+  placed: Placement[],
+  byId: Map<string, Photo>,
+  region: Rect,
+  gutter: number,
+  neededNicheArea: number,
+): Placement[] {
+  let next = placed
+  const needMin = neededNicheArea * FOCUS_MIN_RATIO
+  const g = Math.max(0, gutter)
+  for (let k = 0; k < 4; k++) {
+    const focusPlaced = next.filter((item) => byId.get(item.photoId)?.group === 'focus')
+    if (focusPlaced.length === 0) return next
+    const smallest = focusPlaced.slice().sort((a, b) => cellArea(a) - cellArea(b))[0]
+    if (cellArea(smallest) >= needMin - 1) return next
+    const photo = byId.get(smallest.photoId)
+    if (!photo) return next
+    let best: { extra: number; next: Placement } | null = null
+    for (const dir of ['right', 'left', 'down', 'up'] as Dir[]) {
+      const slack = sideExtra(smallest, next, dir, g)
+      if (slack == null || slack <= 0.75) continue
+      const grown = tryExpand(smallest, dir, next, photo, region, g, needMin)
+      if (!grown || grown.area < 0.75 || !inRegion(grown.next, region)) continue
+      if (!best || grown.area < best.extra) best = { extra: grown.area, next: grown.next }
+    }
+    if (!best) break
+    next = replacePlacement(next, best.next)
+  }
+  return next
+}
+
 function settleExpandPass(
   placed: Placement[],
   byId: Map<string, Photo>,
@@ -3244,103 +3632,82 @@ function settleExpandPass(
   const g = Math.max(0, gutter)
   let next = placed.map((item) => ({ ...item }))
   let changed = false
-  const used = new Set<string>()
   const liveCap = (photo: Photo) => {
     if (photo.group === 'focus') return undefined
     const focusPlaced = next.filter((item) => byId.get(item.photoId)?.group === 'focus')
     if (focusPlaced.length > 0) return nicheAreaCap(focusPlaced)
     return capOf(photo)
   }
-  const holeRank = (hole: Rect) => {
-    const neighbors = settleHoleNeighbors(hole, next, g)
-    const dirs = [...new Set(neighbors.map((entry) => entry.side))]
-    const opposite =
-      (dirs.includes('left') && dirs.includes('right')) || (dirs.includes('up') && dirs.includes('down'))
-    const interior = !holeTouchesBounds(hole, region)
-    const contact = neighbors.reduce((sum, entry) => sum + entry.contact, 0)
-    return (
-      (opposite ? 4_000_000 : 0) +
-      (interior ? 2_000_000 : 0) +
-      (dirs.length >= 2 ? 1_000_000 : 0) +
-      contact * 10 -
-      Math.min(hole.w, hole.h)
-    )
+  const runJob = (job: GrowJob, allowFocus: boolean): boolean => {
+    const current = next.find((item) => item.photoId === job.item.photoId)
+    if (!current) return false
+    const photo = byId.get(current.photoId)
+    if (!photo) return false
+    if (photo.group === 'focus' && !allowFocus) return false
+    let cap = liveCap(photo)
+    const fresh = { ...job, item: current }
+    let applied = applyGrowCascade(fresh, next, photo, byId, region, g, cap, 0)
+    if (!applied && photo.group !== 'focus') {
+      const proposed = growBoxToward(current, job.hole, job.side, photo, region, undefined)
+      if (proposed) next = liftFocusCap(next, byId, region, g, cellArea(proposed))
+      cap = liveCap(photo)
+      const retry = { ...job, item: next.find((item) => item.photoId === current.photoId) ?? current }
+      applied = applyGrowCascade(retry, next, photo, byId, region, g, cap, 0)
+    }
+    if (!applied) return false
+    if (!ratioHolds(applied, byId)) {
+      const grown = applied.find((item) => item.photoId === current.photoId) ?? current
+      applied = liftFocusCap(applied, byId, region, g, cellArea(grown))
+      if (!ratioHolds(applied, byId)) return false
+    }
+    next = applied
+    return true
   }
-  const collectHoles = () =>
-    [...leftoverHoles(region, next, g), ...tJunctionHoles(next, g, region)]
-      .filter((hole) => closeableSettleHole(hole, next, region, g, typicalCellArea(next)))
-      .sort((a, b) => holeRank(b) - holeRank(a))
 
-  const widenHoles = (focusOnly: boolean) => {
-    for (const hole of collectHoles()) {
-      const neighbors = settleHoleNeighbors(hole, next, g)
-        .filter((entry) => {
-          if (used.has(entry.item.photoId)) return false
-          const photo = byId.get(entry.item.photoId)
-          if (!photo) return false
-          return focusOnly ? photo.group === 'focus' : photo.group !== 'focus'
-        })
-        .sort((a, b) => b.contact - a.contact)
-      for (const neighbor of neighbors) {
-        const photo = byId.get(neighbor.item.photoId)
-        if (!photo) continue
-        const current = next.find((item) => item.photoId === neighbor.item.photoId) ?? neighbor.item
-        const cap = liveCap(photo)
-        if (cap != null && cellArea(current) >= cap - 0.75) continue
-        const dirs = [...new Set(settleHoleNeighbors(hole, next, g).map((entry) => entry.side))]
-        const opposite =
-          (dirs.includes('left') && dirs.includes('right')) ||
-          (dirs.includes('up') && dirs.includes('down'))
-        const clipped = clipHoleToJog(hole, current, neighbor.side, settleHoleNeighbors(hole, next, g))
-        const target = opposite ? paddedHole(clipped, neighbor.side, g) : clipped
-        let grown = growTowardLegal(current, target, neighbor.side, photo, next, region, g, cap)
-        if (!grown) {
-          const extra = tryExpand(current, neighbor.side, next, photo, region, g, cap)
-          if (!extra || extra.area < 0.75 || !inRegion(extra.next, region)) continue
-          grown = extra.next
-        }
-        next = replacePlacement(next, grown)
-        used.add(current.photoId)
+  const jobs = alignJobs(next, g)
+    .filter((job) => byId.get(job.item.photoId)?.group !== 'focus')
+    .sort((a, b) => Math.min(a.hole.w, a.hole.h) - Math.min(b.hole.w, b.hole.h))
+  for (const job of jobs) {
+    if (runJob(job, false)) changed = true
+  }
+
+  const typical = typicalCellArea(next)
+  const holes = [...leftoverHoles(region, next, g), ...tJunctionHoles(next, g, region)]
+    .filter((hole) => closeableSettleHole(hole, next, region, g, typical))
+    .sort((a, b) => Math.min(a.w, a.h) - Math.min(b.w, b.h))
+  for (const hole of holes) {
+    const neighbors = settleHoleNeighbors(hole, next, g).sort((a, b) => {
+      const thin = hole.w < hole.h
+      const aThin = thin ? a.side === 'left' || a.side === 'right' : a.side === 'up' || a.side === 'down'
+      const bThin = thin ? b.side === 'left' || b.side === 'right' : b.side === 'up' || b.side === 'down'
+      const aFocus = byId.get(a.item.photoId)?.group === 'focus' ? 1 : 0
+      const bFocus = byId.get(b.item.photoId)?.group === 'focus' ? 1 : 0
+      return Number(bThin) - Number(aThin) || bFocus - aFocus || b.contact - a.contact
+    })
+    for (const neighbor of neighbors) {
+      const job: GrowJob = { item: neighbor.item, side: neighbor.side, hole }
+      const thin = Math.min(hole.w, hole.h) < Math.max(g + 40, Math.sqrt(typical) * 0.45)
+      if (runJob(job, thin)) {
         changed = true
         break
       }
     }
   }
 
-  const widenExtras = (focusOnly: boolean) => {
-    for (const start of next.slice()) {
-      const item = next.find((entry) => entry.photoId === start.photoId) ?? start
-      if (used.has(item.photoId)) continue
-      const photo = byId.get(item.photoId)
-      if (!photo) continue
-      if (focusOnly ? photo.group !== 'focus' : photo.group === 'focus') continue
-      let best: { extra: number; area: number; grown: Placement } | null = null
-      for (const dir of ['right', 'left', 'down', 'up'] as Dir[]) {
-        const extra = sideExtra(item, next, dir, g)
-        if (extra == null || extra <= 0.75) continue
-        const grown = tryExpand(item, dir, next, photo, region, g, liveCap(photo))
-        if (!grown || grown.area < 0.75 || !inRegion(grown.next, region)) continue
-        if (
-          !best ||
-          extra > best.extra + 0.75 ||
-          (Math.abs(extra - best.extra) <= 0.75 && grown.area > best.area)
-        ) {
-          best = { extra, area: grown.area, grown: grown.next }
-        }
-      }
-      if (best) {
-        next = replacePlacement(next, best.grown)
-        used.add(item.photoId)
-        changed = true
-      }
+  for (const start of next.slice()) {
+    const item = next.find((entry) => entry.photoId === start.photoId) ?? start
+    const photo = byId.get(item.photoId)
+    if (!photo || photo.group === 'focus') continue
+    for (const dir of ['right', 'left', 'down', 'up'] as Dir[]) {
+      const extra = sideExtra(item, next, dir, g)
+      if (extra == null || extra <= 0.75 || extra > Math.max(80, Math.min(item.w, item.h) * 0.55)) continue
+      const grown = tryExpand(item, dir, next, photo, region, g, liveCap(photo))
+      if (!grown || grown.area < 0.75 || !inRegion(grown.next, region)) continue
+      next = replacePlacement(next, grown.next)
+      changed = true
+      break
     }
   }
-
-  widenHoles(true)
-  widenExtras(true)
-  used.clear()
-  widenHoles(false)
-  widenExtras(false)
   return changed ? next : null
 }
 
