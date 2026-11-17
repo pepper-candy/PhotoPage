@@ -239,6 +239,7 @@ function App() {
   const [starring, setStarring] = useState(false)
   const [placements, setPlacements] = useState<Placement[]>([])
   const [packing, setPacking] = useState(false)
+  const [importing, setImporting] = useState(false)
   const packId = useRef(0)
 
   const activePreset = PRESETS.find((item) => item.id === preset) ?? PRESETS.find((item) => item.id === DEFAULT_PRESET) ?? PRESETS[0]
@@ -271,7 +272,8 @@ function App() {
   const packSig = `${photos.map((photo) => `${photo.id}:${photo.group}:${photo.safe.x}:${photo.safe.y}:${photo.safe.w}:${photo.safe.h}`).join(',')}|${hintPage.width}x${hintPage.height}|${gutter}|${layout}|${includeAll}|${breakIndex}`
   const packedSigRef = useRef('')
   const cancelJob = useRef<(() => void) | null>(null)
-  const showSpin = photos.length > 0 && (packing || packSig !== packedSigRef.current)
+  const showSpin = importing || (photos.length > 0 && (packing || packSig !== packedSigRef.current))
+  const spinLabel = importing && photos.length === 0 ? 'Loading photos' : 'Updating preview'
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -372,15 +374,20 @@ function App() {
   async function importFiles(list: FileList | File[]) {
     const files = Array.from(list).filter(isRaster)
     if (files.length === 0) return
-    const loaded = await Promise.all(files.map(loadPhoto))
-    setPhotos((prev) => {
-      const next = [...prev, ...loaded]
-      if (prev.length === 0 && next.length > 0) {
-        setBreakIndex(1)
-        return stamp(next, 1)
-      }
-      return next
-    })
+    setImporting(true)
+    try {
+      const loaded = await Promise.all(files.map(loadPhoto))
+      setPhotos((prev) => {
+        const next = [...prev, ...loaded]
+        if (prev.length === 0 && next.length > 0) {
+          setBreakIndex(1)
+          return stamp(next, 1)
+        }
+        return next
+      })
+    } finally {
+      setImporting(false)
+    }
   }
 
   function clearAll() {
@@ -596,9 +603,9 @@ function App() {
               className={`preview-spin${showSpin ? ' on' : ''}`}
               role={showSpin ? 'status' : undefined}
               aria-live="polite"
-              aria-label={showSpin ? 'Updating preview' : undefined}
+              aria-label={showSpin ? spinLabel : undefined}
               aria-hidden={!showSpin}
-              title={showSpin ? 'Updating preview' : undefined}
+              title={showSpin ? spinLabel : undefined}
             >
               <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden>
                 <circle
@@ -719,7 +726,7 @@ function App() {
                 onStar={promoteToFocus}
               />
               {showSpin ? (
-                <div className="pack-overlay" role="status" aria-label="Updating preview">
+                <div className="pack-overlay" role="status" aria-label={spinLabel}>
                   <span className="pack-overlay-spin" aria-hidden>
                     <svg viewBox="0 0 16 16" width="36" height="36">
                       <circle
