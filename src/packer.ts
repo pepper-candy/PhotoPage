@@ -2842,6 +2842,368 @@ function fillOnePocket(photo: Photo, hole: Rect, maxArea: number, minSide = 0): 
   return fillCell(photo, box)
 }
 
+function inRegion(box: Rect, region: Rect): boolean {
+  return (
+    box.x >= region.x - EPS &&
+    box.y >= region.y - EPS &&
+    box.x + box.w <= region.x + region.w + EPS &&
+    box.y + box.h <= region.y + region.h + EPS
+  )
+}
+
+type FacingHit = { other: Placement; gap: number; overlap: number }
+
+function oppositeDir(dir: Dir): Dir {
+  if (dir === 'right') return 'left'
+  if (dir === 'left') return 'right'
+  if (dir === 'down') return 'up'
+  return 'down'
+}
+
+function facingHits(item: Placement, others: Placement[], dir: Dir): FacingHit[] {
+  const hits: FacingHit[] = []
+  for (const other of others) {
+    if (other.photoId === item.photoId) continue
+    if (dir === 'right' || dir === 'left') {
+      const overlap = rangeOverlap(item.y, item.y + item.h, other.y, other.y + other.h)
+      if (overlap <= 8) continue
+      const gap = dir === 'right' ? other.x - (item.x + item.w) : item.x - (other.x + other.w)
+      if (gap < -EPS) continue
+      if (dir === 'right' && other.x + EPS < item.x + item.w) continue
+      if (dir === 'left' && other.x + other.w > item.x + EPS) continue
+      hits.push({ other, gap, overlap })
+    } else {
+      const overlap = rangeOverlap(item.x, item.x + item.w, other.x, other.x + other.w)
+      if (overlap <= 8) continue
+      const gap = dir === 'down' ? other.y - (item.y + item.h) : item.y - (other.y + other.h)
+      if (gap < -EPS) continue
+      if (dir === 'down' && other.y + EPS < item.y + item.h) continue
+      if (dir === 'up' && other.y + other.h > item.y + EPS) continue
+      hits.push({ other, gap, overlap })
+    }
+  }
+  hits.sort((a, b) => a.gap - b.gap || b.overlap - a.overlap)
+  return hits
+}
+
+function sideExtra(item: Placement, others: Placement[], dir: Dir, gutter: number): number | null {
+  const hits = facingHits(item, others, dir)
+  if (hits.length === 0) return null
+  return Math.max(0, hits[0].gap - gutter)
+}
+
+function occupiedSideWorsened(
+  before: Placement,
+  after: Placement,
+  others: Placement[],
+  gutter: number,
+): boolean {
+  for (const dir of ['right', 'left', 'down', 'up'] as Dir[]) {
+    const prev = sideExtra(before, others, dir, gutter)
+    if (prev == null) continue
+    const next = sideExtra(after, others, dir, gutter)
+    if (next == null) {
+      if (prev <= gutter + 1.5) return true
+      continue
+    }
+    if (next > prev + 0.75) return true
+  }
+  return false
+}
+
+function extraSum(item: Placement, others: Placement[], gutter: number): number {
+  let sum = 0
+  for (const dir of ['right', 'left', 'down', 'up'] as Dir[]) {
+    const extra = sideExtra(item, others, dir, gutter)
+    if (extra != null) sum += extra
+  }
+  return sum
+}
+
+function shiftedPlacement(item: Placement, dx: number, dy: number): Placement {
+  return { ...item, x: item.x + dx, y: item.y + dy }
+}
+
+function legalShift(
+  item: Placement,
+  dx: number,
+  dy: number,
+  placed: Placement[],
+  gutter: number,
+  region: Rect,
+): Placement | null {
+  if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return null
+  const next = shiftedPlacement(item, dx, dy)
+  if (!inRegion(next, region)) return null
+  const others = placed.filter((other) => other.photoId !== item.photoId)
+  if (collide(next, others, gutter)) return null
+  return next
+}
+
+function maxLegalShift(
+  item: Placement,
+  dx: number,
+  dy: number,
+  placed: Placement[],
+  gutter: number,
+  region: Rect,
+): Placement | null {
+  const direct = legalShift(item, dx, dy, placed, gutter, region)
+  if (direct) return direct
+  let lo = 0
+  let hi = 1
+  let best: Placement | null = null
+  for (let i = 0; i < 12; i++) {
+    const mid = (lo + hi) / 2
+    const trial = legalShift(item, dx * mid, dy * mid, placed, gutter, region)
+    if (trial) {
+      best = trial
+      lo = mid
+    } else {
+      hi = mid
+    }
+  }
+  if (!best) return null
+  if (Math.hypot(best.x - item.x, best.y - item.y) < 0.75) return null
+  return best
+}
+
+function replacePlacement(placed: Placement[], next: Placement): Placement[] {
+  return placed.map((item) => (item.photoId === next.photoId ? next : item))
+}
+
+function bestSlideFor(
+  item: Placement,
+  placed: Placement[],
+  gutter: number,
+  region: Rect,
+): Placement | null {
+  const g = Math.max(0, gutter)
+  const others = placed.filter((other) => other.photoId !== item.photoId)
+  const beforeExtra = extraSum(item, others, g)
+  const beforeContact = contactLength(item, others, g)
+  let best: Placement | null = null
+  let bestExtra = beforeExtra
+  let bestContact = beforeContact
+  const consider = (dx: number, dy: number) => {
+    const moved = maxLegalShift(item, dx, dy, placed, g, region)
+    if (!moved) return
+    if (occupiedSideWorsened(item, moved, others, g)) return
+    const extra = extraSum(moved, others, g)
+    const contact = contactLength(moved, others, g)
+    const extraDrop = beforeExtra - extra
+    const contactGain = contact - beforeContact
+    if (extraDrop < 0.5 && contactGain < 0.75) return
+    if (
+      extra < bestExtra - 0.25 ||
+      (Math.abs(extra - bestExtra) <= 0.25 && contact > bestContact + 0.5)
+    ) {
+      best = moved
+      bestExtra = extra
+      bestContact = contact
+    }
+  }
+  for (const dir of ['right', 'left', 'down', 'up'] as Dir[]) {
+    const hits = facingHits(item, others, dir)
+    if (hits.length === 0) continue
+    const extra = Math.max(0, hits[0].gap - g)
+    const opp = sideExtra(item, others, oppositeDir(dir), g)
+    const slack = opp == null ? extra : Math.max(0, opp)
+    const move = Math.min(extra, slack)
+    if (move > 0.75) {
+      if (dir === 'right') consider(move, 0)
+      if (dir === 'left') consider(-move, 0)
+      if (dir === 'down') consider(0, move)
+      if (dir === 'up') consider(0, -move)
+    }
+    for (const hit of hits) {
+      if (dir === 'right' || dir === 'left') {
+        consider(0, hit.other.y - item.y)
+        consider(0, hit.other.y + hit.other.h - (item.y + item.h))
+      } else {
+        consider(hit.other.x - item.x, 0)
+        consider(hit.other.x + hit.other.w - (item.x + item.w), 0)
+      }
+    }
+  }
+  return best
+}
+
+function holeEdgeContact(item: Placement, hole: Rect, side: Dir): number {
+  if (side === 'right' || side === 'left') {
+    return rangeOverlap(item.y, item.y + item.h, hole.y, hole.y + hole.h)
+  }
+  return rangeOverlap(item.x, item.x + item.w, hole.x, hole.x + hole.w)
+}
+
+function settleHoleNeighbors(
+  hole: Rect,
+  placed: Placement[],
+  gutter: number,
+): { item: Placement; side: Dir; contact: number }[] {
+  return placed
+    .map((item) => {
+      const side = edgeSide(item, hole, gutter)
+      if (!side) return null
+      return { item, side, contact: holeEdgeContact(item, hole, side) }
+    })
+    .filter((entry): entry is { item: Placement; side: Dir; contact: number } => entry != null)
+}
+
+function closeableSettleHole(
+  hole: Rect,
+  placed: Placement[],
+  region: Rect,
+  gutter: number,
+  typical: number,
+): boolean {
+  const neighbors = settleHoleNeighbors(hole, placed, gutter)
+  const n = neighbors.length
+  if (n === 0) return false
+  const dirs = [...new Set(neighbors.map((entry) => entry.side))]
+  const interior = !holeTouchesBounds(hole, region)
+  const typicalSide = Math.sqrt(Math.max(typical, 1))
+  const minSide = Math.min(hole.w, hole.h)
+  const thin = minSide < Math.max(gutter + 24, typicalSide * 0.48)
+  const small = cellArea(hole) < Math.max(typical * 0.9, 1)
+  const opposite =
+    (dirs.includes('left') && dirs.includes('right')) || (dirs.includes('up') && dirs.includes('down'))
+  if (opposite) return true
+  if (interior && (thin || n >= 2)) return true
+  return thin && small && (n >= 2 || dirs.length >= 2)
+}
+
+function paddedHole(hole: Rect, side: Dir, gutter: number): Rect {
+  const pad = Math.max(0, gutter)
+  if (side === 'right') return { ...hole, w: hole.w + pad }
+  if (side === 'left') return { ...hole, x: hole.x - pad, w: hole.w + pad }
+  if (side === 'down') return { ...hole, h: hole.h + pad }
+  return { ...hole, y: hole.y - pad, h: hole.h + pad }
+}
+
+function settleExpandPass(
+  placed: Placement[],
+  byId: Map<string, Photo>,
+  gutter: number,
+  region: Rect,
+  capOf: (photo: Photo) => number | undefined,
+): Placement[] | null {
+  const g = Math.max(0, gutter)
+  let next = placed.map((item) => ({ ...item }))
+  let changed = false
+  const used = new Set<string>()
+
+  for (const start of next.slice()) {
+    const item = next.find((entry) => entry.photoId === start.photoId) ?? start
+    const photo = byId.get(item.photoId)
+    if (!photo) continue
+    let best: { extra: number; area: number; grown: Placement } | null = null
+    for (const dir of ['right', 'left', 'down', 'up'] as Dir[]) {
+      const extra = sideExtra(item, next, dir, g)
+      if (extra == null || extra <= 0.75) continue
+      const grown = tryExpand(item, dir, next, photo, region, g, capOf(photo))
+      if (!grown || grown.area < 0.75 || !inRegion(grown.next, region)) continue
+      if (
+        !best ||
+        extra > best.extra + 0.75 ||
+        (Math.abs(extra - best.extra) <= 0.75 && grown.area > best.area)
+      ) {
+        best = { extra, area: grown.area, grown: grown.next }
+      }
+    }
+    if (best) {
+      next = replacePlacement(next, best.grown)
+      changed = true
+    }
+  }
+
+  const typical = typicalCellArea(next)
+  const holes = leftoverHoles(region, next, g)
+    .filter((hole) => closeableSettleHole(hole, next, region, g, typical))
+    .sort((a, b) => {
+      const rank = (hole: Rect) => {
+        const neighbors = settleHoleNeighbors(hole, next, g)
+        const dirs = [...new Set(neighbors.map((entry) => entry.side))]
+        const opposite =
+          (dirs.includes('left') && dirs.includes('right')) ||
+          (dirs.includes('up') && dirs.includes('down'))
+        const interior = !holeTouchesBounds(hole, region)
+        const contact = neighbors.reduce((sum, entry) => sum + entry.contact, 0)
+        return (
+          (opposite ? 4_000_000 : 0) +
+          (interior ? 2_000_000 : 0) +
+          contact * 10 -
+          Math.min(hole.w, hole.h)
+        )
+      }
+      return rank(b) - rank(a)
+    })
+
+  for (const hole of holes) {
+    const neighbors = settleHoleNeighbors(hole, next, g)
+      .filter((entry) => !used.has(entry.item.photoId))
+      .sort((a, b) => b.contact - a.contact)
+    for (const neighbor of neighbors) {
+      const photo = byId.get(neighbor.item.photoId)
+      if (!photo) continue
+      const current = next.find((item) => item.photoId === neighbor.item.photoId) ?? neighbor.item
+      const grown = expandToward(
+        current,
+        paddedHole(hole, neighbor.side, g),
+        neighbor.side,
+        photo,
+        next,
+        region,
+        g,
+        capOf(photo),
+      )
+      if (!grown || cellArea(grown) < cellArea(current) + 0.75 || !inRegion(grown, region)) continue
+      next = replacePlacement(next, grown)
+      used.add(grown.photoId)
+      changed = true
+      break
+    }
+  }
+  return changed ? next : null
+}
+
+export function settlePlacements(
+  photos: Photo[],
+  placements: Placement[],
+  gutter: number,
+  caps: { nicheMaxArea?: number },
+  region: Rect,
+): Placement[] {
+  if (placements.length < 2 || region.w < 8 || region.h < 8) return placements
+  const byId = new Map(photos.map((photo) => [photo.id, photo]))
+  let placed = placements.map((item) => ({ ...item }))
+  let nicheCap = caps.nicheMaxArea
+  const refreshCap = () => {
+    const focusPlaced = placed.filter((item) => byId.get(item.photoId)?.group === 'focus')
+    nicheCap = focusPlaced.length > 0 ? nicheAreaCap(focusPlaced) : caps.nicheMaxArea
+  }
+  const capOf = (photo: Photo) =>
+    photo.group === 'focus' || nicheCap == null || !Number.isFinite(nicheCap) ? undefined : nicheCap
+
+  for (let iter = 0; iter < 72; iter++) {
+    let better = false
+    for (let i = 0; i < placed.length; i++) {
+      const moved = bestSlideFor(placed[i], placed, gutter, region)
+      if (!moved) continue
+      placed[i] = moved
+      better = true
+    }
+    const expanded = settleExpandPass(placed, byId, gutter, region, capOf)
+    if (expanded) {
+      placed = expanded
+      better = true
+      refreshCap()
+    }
+    if (!better) break
+  }
+  return placed
+}
+
 function fillPhotoPockets(
   placed: Placement[],
   leftover: Photo[],
@@ -2941,6 +3303,10 @@ function packBoundless(
     leftover = tagged.filter((photo) => !placed.some((item) => item.photoId === photo.id))
     placed = fillPhotoPockets(placed, leftover, g, cap)
   }
+
+  const settleBox = boundsOf(placed)
+  const settleCap = nicheAreaCap(placed.filter((item) => focusIds.has(item.photoId)))
+  placed = settlePlacements(tagged, placed, g, { nicheMaxArea: settleCap }, settleBox)
 
   return normalizePlacements(placed)
 }
