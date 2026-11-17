@@ -3036,6 +3036,18 @@ function holeEdgeContact(item: Placement, hole: Rect, side: Dir): number {
   return rangeOverlap(item.x, item.x + item.w, hole.x, hole.x + hole.w)
 }
 
+function settleEdgeSide(cell: Rect, hole: Rect, gutter: number): Dir | null {
+  const g = Math.max(0, gutter)
+  const tol = Math.max(12, 2 * g + 8)
+  const vert = cell.y < hole.y + hole.h - EPS && hole.y < cell.y + cell.h - EPS
+  const horz = cell.x < hole.x + hole.w - EPS && hole.x < cell.x + cell.w - EPS
+  if (vert && hole.x >= cell.x + cell.w - EPS && hole.x - (cell.x + cell.w) <= tol) return 'right'
+  if (vert && cell.x >= hole.x + hole.w - EPS && cell.x - (hole.x + hole.w) <= tol) return 'left'
+  if (horz && hole.y >= cell.y + cell.h - EPS && hole.y - (cell.y + cell.h) <= tol) return 'down'
+  if (horz && cell.y >= hole.y + hole.h - EPS && cell.y - (hole.y + hole.h) <= tol) return 'up'
+  return edgeSide(cell, hole, gutter)
+}
+
 function settleHoleNeighbors(
   hole: Rect,
   placed: Placement[],
@@ -3043,9 +3055,11 @@ function settleHoleNeighbors(
 ): { item: Placement; side: Dir; contact: number }[] {
   return placed
     .map((item) => {
-      const side = edgeSide(item, hole, gutter)
+      const side = settleEdgeSide(item, hole, gutter)
       if (!side) return null
-      return { item, side, contact: holeEdgeContact(item, hole, side) }
+      const contact = holeEdgeContact(item, hole, side)
+      if (contact <= 2) return null
+      return { item, side, contact }
     })
     .filter((entry): entry is { item: Placement; side: Dir; contact: number } => entry != null)
 }
@@ -3064,13 +3078,13 @@ function closeableSettleHole(
   const interior = !holeTouchesBounds(hole, region)
   const typicalSide = Math.sqrt(Math.max(typical, 1))
   const minSide = Math.min(hole.w, hole.h)
-  const thin = minSide < Math.max(gutter + 24, typicalSide * 0.48)
-  const small = cellArea(hole) < Math.max(typical * 0.9, 1)
+  const thin = minSide < Math.max(gutter + 36, typicalSide * 0.55)
   const opposite =
     (dirs.includes('left') && dirs.includes('right')) || (dirs.includes('up') && dirs.includes('down'))
   if (opposite) return true
-  if (interior && (thin || n >= 2)) return true
-  return thin && small && (n >= 2 || dirs.length >= 2)
+  if (interior) return true
+  if (dirs.length >= 2) return true
+  return thin && n >= 1
 }
 
 function paddedHole(hole: Rect, side: Dir, gutter: number): Rect {
@@ -3079,6 +3093,145 @@ function paddedHole(hole: Rect, side: Dir, gutter: number): Rect {
   if (side === 'left') return { ...hole, x: hole.x - pad, w: hole.w + pad }
   if (side === 'down') return { ...hole, h: hole.h + pad }
   return { ...hole, y: hole.y - pad, h: hole.h + pad }
+}
+
+function clipHoleToJog(
+  hole: Rect,
+  grower: Placement,
+  side: Dir,
+  neighbors: { item: Placement; side: Dir; contact: number }[],
+): Rect {
+  const others = neighbors.filter((entry) => entry.item.photoId !== grower.photoId)
+  const opposite = others.filter((entry) => entry.side === oppositeDir(side))
+  if (opposite.length > 0) return hole
+  const perp = others.filter((entry) => entry.side !== side)
+  if (perp.length === 0) return hole
+  let x0 = hole.x
+  let y0 = hole.y
+  let x1 = hole.x + hole.w
+  let y1 = hole.y + hole.h
+  if (side === 'right') {
+    x1 = Math.min(x1, Math.max(...perp.map((entry) => entry.item.x + entry.item.w)))
+  } else if (side === 'left') {
+    x0 = Math.max(x0, Math.min(...perp.map((entry) => entry.item.x)))
+  } else if (side === 'down') {
+    y1 = Math.min(y1, Math.max(...perp.map((entry) => entry.item.y + entry.item.h)))
+  } else {
+    y0 = Math.max(y0, Math.min(...perp.map((entry) => entry.item.y)))
+  }
+  return { x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) }
+}
+
+function lerpGrowHole(placement: Placement, hole: Rect, side: Dir, t: number): Rect {
+  const u = clamp(t, 0, 1)
+  if (side === 'right') {
+    const to = hole.x + hole.w
+    const from = placement.x + placement.w
+    return { ...hole, w: from + (to - from) * u - hole.x }
+  }
+  if (side === 'left') {
+    const to = hole.x
+    const from = placement.x
+    const x = from + (to - from) * u
+    return { ...hole, x, w: hole.x + hole.w - x }
+  }
+  if (side === 'down') {
+    const to = hole.y + hole.h
+    const from = placement.y + placement.h
+    return { ...hole, h: from + (to - from) * u - hole.y }
+  }
+  const to = hole.y
+  const from = placement.y
+  const y = from + (to - from) * u
+  return { ...hole, y, h: hole.y + hole.h - y }
+}
+
+function growTowardLegal(
+  placement: Placement,
+  hole: Rect,
+  side: Dir,
+  photo: Photo,
+  others: Placement[],
+  region: Rect,
+  gutter: number,
+  maxArea?: number,
+): Placement | null {
+  const direct = expandToward(placement, hole, side, photo, others, region, gutter, maxArea)
+  if (direct && inRegion(direct, region) && cellArea(direct) > cellArea(placement) + 0.75) return direct
+  let lo = 0
+  let hi = 1
+  let best: Placement | null = null
+  for (let i = 0; i < 14; i++) {
+    const mid = (lo + hi) / 2
+    const trial = expandToward(
+      placement,
+      lerpGrowHole(placement, hole, side, mid),
+      side,
+      photo,
+      others,
+      region,
+      gutter,
+      maxArea,
+    )
+    if (trial && inRegion(trial, region) && cellArea(trial) > cellArea(placement) + 0.75) {
+      best = trial
+      lo = mid
+    } else {
+      hi = mid
+    }
+  }
+  return best
+}
+
+function tJunctionHoles(placed: Placement[], gutter: number, region: Rect): Rect[] {
+  const g = Math.max(0, gutter)
+  const out: Rect[] = []
+  const push = (hole: Rect) => {
+    if (hole.w <= g + 1 || hole.h <= g + 1) return
+    if (!inRegion({ x: hole.x, y: hole.y, w: Math.min(hole.w, region.w), h: Math.min(hole.h, region.h) }, {
+      x: region.x - 1,
+      y: region.y - 1,
+      w: region.w + 2,
+      h: region.h + 2,
+    })) return
+    const clipped = {
+      x: Math.max(hole.x, region.x),
+      y: Math.max(hole.y, region.y),
+      w: Math.min(hole.x + hole.w, region.x + region.w) - Math.max(hole.x, region.x),
+      h: Math.min(hole.y + hole.h, region.y + region.h) - Math.max(hole.y, region.y),
+    }
+    if (clipped.w <= g + 1 || clipped.h <= g + 1) return
+    for (const item of placed) {
+      if (boxesOverlap(clipped, item, g)) return
+    }
+    out.push(clipped)
+  }
+  for (const a of placed) {
+    for (const b of placed) {
+      if (a.photoId === b.photoId) continue
+      const yOv = rangeOverlap(a.y, a.y + a.h, b.y, b.y + b.h)
+      if (yOv > 8) {
+        const gap = b.x - (a.x + a.w)
+        if (gap >= -EPS && gap <= Math.max(80, g + 48)) {
+          const x = a.x + a.w + g
+          const w = Math.max(1, b.x + b.w - x)
+          if (a.y < b.y - g - 2) push({ x, y: a.y, w, h: b.y - g - a.y })
+          if (a.y + a.h > b.y + b.h + g + 2) push({ x, y: b.y + b.h + g, w, h: a.y + a.h - (b.y + b.h + g) })
+        }
+      }
+      const xOv = rangeOverlap(a.x, a.x + a.w, b.x, b.x + b.w)
+      if (xOv > 8) {
+        const gap = b.y - (a.y + a.h)
+        if (gap >= -EPS && gap <= Math.max(80, g + 48)) {
+          const y = a.y + a.h + g
+          const h = Math.max(1, b.y + b.h - y)
+          if (a.x < b.x - g - 2) push({ x: a.x, y, w: b.x - g - a.x, h })
+          if (a.x + a.w > b.x + b.w + g + 2) push({ x: b.x + b.w + g, y, w: a.x + a.w - (b.x + b.w + g), h })
+        }
+      }
+    }
+  }
+  return out
 }
 
 function settleExpandPass(
@@ -3092,78 +3245,102 @@ function settleExpandPass(
   let next = placed.map((item) => ({ ...item }))
   let changed = false
   const used = new Set<string>()
-
-  for (const start of next.slice()) {
-    const item = next.find((entry) => entry.photoId === start.photoId) ?? start
-    const photo = byId.get(item.photoId)
-    if (!photo) continue
-    let best: { extra: number; area: number; grown: Placement } | null = null
-    for (const dir of ['right', 'left', 'down', 'up'] as Dir[]) {
-      const extra = sideExtra(item, next, dir, g)
-      if (extra == null || extra <= 0.75) continue
-      const grown = tryExpand(item, dir, next, photo, region, g, capOf(photo))
-      if (!grown || grown.area < 0.75 || !inRegion(grown.next, region)) continue
-      if (
-        !best ||
-        extra > best.extra + 0.75 ||
-        (Math.abs(extra - best.extra) <= 0.75 && grown.area > best.area)
-      ) {
-        best = { extra, area: grown.area, grown: grown.next }
-      }
-    }
-    if (best) {
-      next = replacePlacement(next, best.grown)
-      changed = true
-    }
+  const liveCap = (photo: Photo) => {
+    if (photo.group === 'focus') return undefined
+    const focusPlaced = next.filter((item) => byId.get(item.photoId)?.group === 'focus')
+    if (focusPlaced.length > 0) return nicheAreaCap(focusPlaced)
+    return capOf(photo)
   }
+  const holeRank = (hole: Rect) => {
+    const neighbors = settleHoleNeighbors(hole, next, g)
+    const dirs = [...new Set(neighbors.map((entry) => entry.side))]
+    const opposite =
+      (dirs.includes('left') && dirs.includes('right')) || (dirs.includes('up') && dirs.includes('down'))
+    const interior = !holeTouchesBounds(hole, region)
+    const contact = neighbors.reduce((sum, entry) => sum + entry.contact, 0)
+    return (
+      (opposite ? 4_000_000 : 0) +
+      (interior ? 2_000_000 : 0) +
+      (dirs.length >= 2 ? 1_000_000 : 0) +
+      contact * 10 -
+      Math.min(hole.w, hole.h)
+    )
+  }
+  const collectHoles = () =>
+    [...leftoverHoles(region, next, g), ...tJunctionHoles(next, g, region)]
+      .filter((hole) => closeableSettleHole(hole, next, region, g, typicalCellArea(next)))
+      .sort((a, b) => holeRank(b) - holeRank(a))
 
-  const typical = typicalCellArea(next)
-  const holes = leftoverHoles(region, next, g)
-    .filter((hole) => closeableSettleHole(hole, next, region, g, typical))
-    .sort((a, b) => {
-      const rank = (hole: Rect) => {
-        const neighbors = settleHoleNeighbors(hole, next, g)
-        const dirs = [...new Set(neighbors.map((entry) => entry.side))]
+  const widenHoles = (focusOnly: boolean) => {
+    for (const hole of collectHoles()) {
+      const neighbors = settleHoleNeighbors(hole, next, g)
+        .filter((entry) => {
+          if (used.has(entry.item.photoId)) return false
+          const photo = byId.get(entry.item.photoId)
+          if (!photo) return false
+          return focusOnly ? photo.group === 'focus' : photo.group !== 'focus'
+        })
+        .sort((a, b) => b.contact - a.contact)
+      for (const neighbor of neighbors) {
+        const photo = byId.get(neighbor.item.photoId)
+        if (!photo) continue
+        const current = next.find((item) => item.photoId === neighbor.item.photoId) ?? neighbor.item
+        const cap = liveCap(photo)
+        if (cap != null && cellArea(current) >= cap - 0.75) continue
+        const dirs = [...new Set(settleHoleNeighbors(hole, next, g).map((entry) => entry.side))]
         const opposite =
           (dirs.includes('left') && dirs.includes('right')) ||
           (dirs.includes('up') && dirs.includes('down'))
-        const interior = !holeTouchesBounds(hole, region)
-        const contact = neighbors.reduce((sum, entry) => sum + entry.contact, 0)
-        return (
-          (opposite ? 4_000_000 : 0) +
-          (interior ? 2_000_000 : 0) +
-          contact * 10 -
-          Math.min(hole.w, hole.h)
-        )
+        const clipped = clipHoleToJog(hole, current, neighbor.side, settleHoleNeighbors(hole, next, g))
+        const target = opposite ? paddedHole(clipped, neighbor.side, g) : clipped
+        let grown = growTowardLegal(current, target, neighbor.side, photo, next, region, g, cap)
+        if (!grown) {
+          const extra = tryExpand(current, neighbor.side, next, photo, region, g, cap)
+          if (!extra || extra.area < 0.75 || !inRegion(extra.next, region)) continue
+          grown = extra.next
+        }
+        next = replacePlacement(next, grown)
+        used.add(current.photoId)
+        changed = true
+        break
       }
-      return rank(b) - rank(a)
-    })
-
-  for (const hole of holes) {
-    const neighbors = settleHoleNeighbors(hole, next, g)
-      .filter((entry) => !used.has(entry.item.photoId))
-      .sort((a, b) => b.contact - a.contact)
-    for (const neighbor of neighbors) {
-      const photo = byId.get(neighbor.item.photoId)
-      if (!photo) continue
-      const current = next.find((item) => item.photoId === neighbor.item.photoId) ?? neighbor.item
-      const grown = expandToward(
-        current,
-        paddedHole(hole, neighbor.side, g),
-        neighbor.side,
-        photo,
-        next,
-        region,
-        g,
-        capOf(photo),
-      )
-      if (!grown || cellArea(grown) < cellArea(current) + 0.75 || !inRegion(grown, region)) continue
-      next = replacePlacement(next, grown)
-      used.add(grown.photoId)
-      changed = true
-      break
     }
   }
+
+  const widenExtras = (focusOnly: boolean) => {
+    for (const start of next.slice()) {
+      const item = next.find((entry) => entry.photoId === start.photoId) ?? start
+      if (used.has(item.photoId)) continue
+      const photo = byId.get(item.photoId)
+      if (!photo) continue
+      if (focusOnly ? photo.group !== 'focus' : photo.group === 'focus') continue
+      let best: { extra: number; area: number; grown: Placement } | null = null
+      for (const dir of ['right', 'left', 'down', 'up'] as Dir[]) {
+        const extra = sideExtra(item, next, dir, g)
+        if (extra == null || extra <= 0.75) continue
+        const grown = tryExpand(item, dir, next, photo, region, g, liveCap(photo))
+        if (!grown || grown.area < 0.75 || !inRegion(grown.next, region)) continue
+        if (
+          !best ||
+          extra > best.extra + 0.75 ||
+          (Math.abs(extra - best.extra) <= 0.75 && grown.area > best.area)
+        ) {
+          best = { extra, area: grown.area, grown: grown.next }
+        }
+      }
+      if (best) {
+        next = replacePlacement(next, best.grown)
+        used.add(item.photoId)
+        changed = true
+      }
+    }
+  }
+
+  widenHoles(true)
+  widenExtras(true)
+  used.clear()
+  widenHoles(false)
+  widenExtras(false)
   return changed ? next : null
 }
 
