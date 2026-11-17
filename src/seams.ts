@@ -172,8 +172,6 @@ function clampDelta(
   photos: Map<string, Photo>,
   cut: Cut,
   delta: number,
-  pageW: number,
-  pageH: number,
 ): number {
   let lo = Number.NEGATIVE_INFINITY
   let hi = Number.POSITIVE_INFINITY
@@ -260,7 +258,7 @@ export function nudgeCut(
   const byPhoto = new Map(photos.map((photo) => [photo.id, photo]))
   const pageW = page?.width ?? Number.POSITIVE_INFINITY
   const pageH = page?.height ?? Number.POSITIVE_INFINITY
-  const want = clampDelta(placements, byPhoto, cut, delta, pageW, pageH)
+  const want = clampDelta(placements, byPhoto, cut, delta)
   if (Math.abs(want) < 1e-6) return placements
   const direct = applyDelta(placements, byPhoto, cut, want, pageW, pageH)
   if (direct) return direct

@@ -358,7 +358,7 @@ function CroppedPhoto({
   )
 }
 
-function pagePoint(event: PointerEvent, el: HTMLElement, page: Page): { x: number; y: number } {
+function pagePoint(event: { clientX: number; clientY: number }, el: HTMLElement, page: Page): { x: number; y: number } {
   const rect = el.getBoundingClientRect()
   return {
     x: ((event.clientX - rect.left) / Math.max(rect.width, 1)) * page.width,
@@ -471,7 +471,7 @@ export default function PagePreview({
     if (next) onPlacements(next)
   }
 
-  function onCutDown(event: PointerEvent<HTMLDivElement>, cut: Cut) {
+  function onCutDown(event: PointerEvent<HTMLButtonElement>, cut: Cut) {
     if (action || packing || !onPlacements) return
     event.preventDefault()
     event.stopPropagation()
