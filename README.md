@@ -36,4 +36,3 @@ npm run dev
 ```
 
 Open the local URL Vite prints.
-```
