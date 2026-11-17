@@ -3089,14 +3089,6 @@ function closeableSettleHole(
   return thin && n >= 1
 }
 
-function paddedHole(hole: Rect, side: Dir, gutter: number): Rect {
-  const pad = Math.max(0, gutter)
-  if (side === 'right') return { ...hole, w: hole.w + pad }
-  if (side === 'left') return { ...hole, x: hole.x - pad, w: hole.w + pad }
-  if (side === 'down') return { ...hole, h: hole.h + pad }
-  return { ...hole, y: hole.y - pad, h: hole.h + pad }
-}
-
 function clipHoleToJog(
   hole: Rect,
   grower: Placement,
@@ -3188,43 +3180,6 @@ function growBoxToward(
   const next = fillCell(photo, { x, y, w, h })
   if (cellArea(next) <= cellArea(placement) + EPS) return null
   return next
-}
-
-function growTowardLegal(
-  placement: Placement,
-  hole: Rect,
-  side: Dir,
-  photo: Photo,
-  others: Placement[],
-  region: Rect,
-  gutter: number,
-  maxArea?: number,
-): Placement | null {
-  const direct = expandToward(placement, hole, side, photo, others, region, gutter, maxArea)
-  if (direct && inRegion(direct, region) && cellArea(direct) > cellArea(placement) + 0.75) return direct
-  let lo = 0
-  let hi = 1
-  let best: Placement | null = null
-  for (let i = 0; i < 14; i++) {
-    const mid = (lo + hi) / 2
-    const trial = expandToward(
-      placement,
-      lerpGrowHole(placement, hole, side, mid),
-      side,
-      photo,
-      others,
-      region,
-      gutter,
-      maxArea,
-    )
-    if (trial && inRegion(trial, region) && cellArea(trial) > cellArea(placement) + 0.75) {
-      best = trial
-      lo = mid
-    } else {
-      hi = mid
-    }
-  }
-  return best
 }
 
 function inGrowPath(blocker: Placement, grower: Placement, side: Dir): boolean {
@@ -3581,15 +3536,12 @@ function fillVacatedStrip(
     const job: GrowJob = { item: entry.item, side: growSide, hole: strip }
     const proposed = growBoxToward(entry.item, strip, growSide, photo, region, undefined)
     const holeArea = proposed ? cellArea(proposed) : undefined
-    const hardCap =
-      photo.group === 'focus'
-        ? undefined
-        : nicheAreaCap(next.filter((item) => byId.get(item.photoId)?.group === 'focus'))
+    const hardCap = nicheAreaCap(next.filter((item) => byId.get(item.photoId)?.group === 'focus'))
     let applied = applyGrowCascade(job, next, photo, byId, region, g, hardCap, depth + 1)
     const modestJog =
       holeArea != null &&
       growSpan(growSide, strip) <= Math.max(80, Math.min(entry.item.w, entry.item.h) * 0.55)
-    if (!applied && photo.group !== 'focus' && holeArea != null && modestJog) {
+    if (!applied && holeArea != null && modestJog) {
       next = liftFocusCap(next, byId, region, g, holeArea)
       const liftedCap = nicheAreaCap(next.filter((item) => byId.get(item.photoId)?.group === 'focus'))
       applied = applyGrowCascade(job, next, photo, byId, region, g, liftedCap, depth + 1)
@@ -3623,14 +3575,16 @@ function liftFocusCap(
   const dirs: Dir[] = ['right', 'left', 'down', 'up']
   const growOnce = (start: Placement[], item: Placement, photo: Photo): Placement[] | null => {
     const current = start.find((entry) => entry.photoId === item.photoId) ?? item
-    let best: Placement[] | null = null
-    let bestArea = cellArea(current)
+    const state: { best: Placement[] | null; bestArea: number } = {
+      best: null,
+      bestArea: cellArea(current),
+    }
     const consider = (applied: Placement[] | null) => {
       if (!applied) return
       const grown = applied.find((entry) => entry.photoId === current.photoId)
-      if (!grown || cellArea(grown) <= bestArea + 0.75) return
-      best = applied
-      bestArea = cellArea(grown)
+      if (!grown || cellArea(grown) <= state.bestArea + 0.75) return
+      state.best = applied
+      state.bestArea = cellArea(grown)
     }
     for (const dir of dirs) {
       const grown = tryExpand(current, dir, start, photo, region, g, needMin)
@@ -3638,12 +3592,13 @@ function liftFocusCap(
         consider(replacePlacement(start, grown.next))
       }
     }
+    const best = state.best
     if (!best) return null
-    if (bestArea >= needMin - 1) return best
+    if (state.bestArea >= needMin - 1) return best
     const midItem = best.find((entry) => entry.photoId === current.photoId)
     if (!midItem) return best
     let best2 = best
-    let best2Area = bestArea
+    let best2Area = state.bestArea
     for (const dir of dirs) {
       const grown = tryExpand(midItem, dir, best, photo, region, g, needMin)
       if (grown && grown.area >= 0.75 && inRegion(grown.next, region) && cellArea(grown.next) > best2Area + 0.75) {
