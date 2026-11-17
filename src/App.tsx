@@ -20,6 +20,8 @@ import {
   DEFAULT_GUTTER,
   DEFAULT_LAYOUT,
   pageSize,
+  PROXY_LONG_EDGE,
+  revokePhoto,
   type LayoutMode,
   type PackJob,
   type PackResult,
@@ -145,27 +147,69 @@ function isRaster(file: File): boolean {
   )
 }
 
-function loadPhoto(file: File): Promise<Photo> {
-  const objectUrl = URL.createObjectURL(file)
+function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image()
-    img.onload = () => {
-      resolve({
-        id: crypto.randomUUID(),
-        name: file.name,
-        objectUrl,
-        width: img.naturalWidth,
-        height: img.naturalHeight,
-        group: 'niche',
-        safe: { x: 0, y: 0, w: img.naturalWidth, h: img.naturalHeight },
-      })
-    }
-    img.onerror = () => {
-      URL.revokeObjectURL(objectUrl)
-      reject(new Error(`Could not load ${file.name}`))
-    }
-    img.src = objectUrl
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error('Could not decode photo'))
+    img.src = url
   })
+}
+
+async function makePreviewUrl(img: HTMLImageElement): Promise<string | null> {
+  const long = Math.max(img.naturalWidth, img.naturalHeight)
+  if (long <= PROXY_LONG_EDGE) return null
+  const scale = PROXY_LONG_EDGE / long
+  const width = Math.max(1, Math.round(img.naturalWidth * scale))
+  const height = Math.max(1, Math.round(img.naturalHeight * scale))
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(img, 0, 0, width, height)
+  const blob = await new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, 'image/jpeg', 0.82)
+  })
+  if (!blob) return null
+  return URL.createObjectURL(blob)
+}
+
+async function loadPhoto(file: File): Promise<Photo> {
+  const objectUrl = URL.createObjectURL(file)
+  try {
+    const img = await loadImage(objectUrl)
+    if (img.decode) {
+      try {
+        await img.decode()
+      } catch {
+        /* drawImage can still succeed */
+      }
+    }
+    const width = img.naturalWidth
+    const height = img.naturalHeight
+    let previewUrl = objectUrl
+    try {
+      previewUrl = (await makePreviewUrl(img)) ?? objectUrl
+    } catch {
+      previewUrl = objectUrl
+    }
+    return {
+      id: crypto.randomUUID(),
+      name: file.name,
+      objectUrl,
+      previewUrl,
+      width,
+      height,
+      group: 'niche',
+      safe: { x: 0, y: 0, w: width, h: height },
+    }
+  } catch {
+    URL.revokeObjectURL(objectUrl)
+    throw new Error(`Could not load ${file.name}`)
+  }
 }
 
 function stamp(list: Photo[], breakAt: number): Photo[] {
@@ -341,7 +385,7 @@ function App() {
 
   function clearAll() {
     setPhotos((prev) => {
-      for (const photo of prev) URL.revokeObjectURL(photo.objectUrl)
+      for (const photo of prev) revokePhoto(photo)
       return []
     })
     setBreakIndex(0)
@@ -355,7 +399,7 @@ function App() {
     if (index < 0) return
     const next = photos.slice()
     const [removed] = next.splice(index, 1)
-    URL.revokeObjectURL(removed.objectUrl)
+    revokePhoto(removed)
     if (selectedId === id) setSelectedId(null)
     commit(next, index < breakIndex ? breakIndex - 1 : breakIndex)
   }

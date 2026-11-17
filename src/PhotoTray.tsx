@@ -1,5 +1,5 @@
 import { useRef, useState, type DragEvent, type PointerEvent as ReactPointerEvent } from 'react'
-import type { Photo } from './types.ts'
+import { displayUrl, type Photo } from './types.ts'
 
 type Props = {
   photos: Photo[]
@@ -204,7 +204,7 @@ export default function PhotoTray({
           modifying ? `Delete ${photo.name}` : starring ? `Focus ${photo.name}` : photo.name
         }
       >
-        <img src={photo.objectUrl} alt="" draggable={false} />
+        <img src={displayUrl(photo)} alt="" draggable={false} />
         <span className="seq-name">{photo.name}</span>
       </div>
     )

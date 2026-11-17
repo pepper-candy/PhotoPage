@@ -12,10 +12,24 @@ export type Photo = {
   id: string
   name: string
   objectUrl: string
+  previewUrl: string
   width: number
   height: number
   group: PhotoGroup
   safe: Rect
+}
+
+export const PROXY_LONG_EDGE = 1280
+
+export function displayUrl(photo: Photo): string {
+  return photo.previewUrl || photo.objectUrl
+}
+
+export function revokePhoto(photo: Photo) {
+  URL.revokeObjectURL(photo.objectUrl)
+  if (photo.previewUrl && photo.previewUrl !== photo.objectUrl) {
+    URL.revokeObjectURL(photo.previewUrl)
+  }
 }
 
 export type Page = {

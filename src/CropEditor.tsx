@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { clamp } from './crop.ts'
-import type { Photo, Rect } from './types.ts'
+import { displayUrl, type Photo, type Rect } from './types.ts'
 
 type Handle = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw' | 'move'
 
@@ -123,7 +123,7 @@ export default function CropEditor({ photo, onChange, onClose }: Props) {
         <div className="crop-inner">
           <img
             ref={imgRef}
-            src={photo.objectUrl}
+            src={displayUrl(photo)}
             alt={photo.name}
             draggable={false}
             onLoad={() => {

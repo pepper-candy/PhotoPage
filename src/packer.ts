@@ -2385,33 +2385,40 @@ function sizeAgainstEdge(
   side: Dir,
   shortSide: number,
   maxArea: number,
+  shareEdge: boolean,
 ): { w: number; h: number } {
-  const a = targetCellAspect(photo)
-  const { min, max } = legalAspectRange(photo)
+  const a = clamp(targetCellAspect(photo), legalAspectRange(photo).min, legalAspectRange(photo).max)
   const natural = sizedForShort(photo, shortSide)
   const edge = side === 'left' || side === 'right' ? neighbor.h : neighbor.w
   let w: number
   let h: number
-  if (side === 'left' || side === 'right') {
-    h = edge
-    w = h * clamp(a, min, max)
+  if (shareEdge) {
+    if (side === 'left' || side === 'right') {
+      h = edge
+      w = h * a
+    } else {
+      w = edge
+      h = w / a
+    }
+    const natArea = natural.w * natural.h
+    if (w * h > natArea * 1.45) {
+      const scale = Math.sqrt((natArea * 1.45) / Math.max(w * h, 0.001))
+      w *= scale
+      h *= scale
+    }
+  } else if (side === 'left' || side === 'right') {
+    h = Math.min(natural.h, edge)
+    w = h * a
   } else {
-    w = edge
-    h = w / clamp(a, min, max)
+    w = Math.min(natural.w, edge)
+    h = w / a
   }
-  const area = w * h
-  const natArea = natural.w * natural.h
-  if (Number.isFinite(maxArea) && area > maxArea + EPS) {
-    const scale = Math.sqrt(maxArea / Math.max(area, 0.001))
+  if (Number.isFinite(maxArea) && w * h > maxArea + EPS) {
+    const scale = Math.sqrt(maxArea / Math.max(w * h, 0.001))
     w *= scale
     h *= scale
   }
-  if (area > natArea * 2.2) {
-    const scale = Math.sqrt((natArea * 2.2) / Math.max(area, 0.001))
-    w *= scale
-    h *= scale
-  }
-  if (Math.min(w, h) < shortSide * 0.45) {
+  if (Math.min(w, h) < shortSide * 0.4) {
     w = natural.w
     h = natural.h
   }
@@ -2425,23 +2432,45 @@ type BoundlessSlot = {
   opposite: boolean
 }
 
+function onSilhouette(neighbor: Placement, cluster: Rect, side: Dir, gutter: number): boolean {
+  const slack = Math.max(2, gutter + 1)
+  if (side === 'right') return neighbor.x + neighbor.w >= cluster.x + cluster.w - slack
+  if (side === 'left') return neighbor.x <= cluster.x + slack
+  if (side === 'down') return neighbor.y + neighbor.h >= cluster.y + cluster.h - slack
+  return neighbor.y <= cluster.y + slack
+}
+
+function slotExtends(box: Rect, cluster: Rect): boolean {
+  return (
+    box.x < cluster.x - EPS ||
+    box.y < cluster.y - EPS ||
+    box.x + box.w > cluster.x + cluster.w + EPS ||
+    box.y + box.h > cluster.y + cluster.h + EPS
+  )
+}
+
 function collectEdgeSlots(
   photo: Photo,
   placed: Placement[],
   gutter: number,
   shortSide: number,
   maxArea: number,
+  shareEdge: boolean,
+  exteriorOnly: boolean,
 ): BoundlessSlot[] {
   const slots: BoundlessSlot[] = []
   const photoWide = isWideAspect(targetCellAspect(photo))
+  const cluster = boundsOf(placed)
   for (const neighbor of placed) {
     const neighWide = isWideAspect(neighbor.w / Math.max(neighbor.h, 0.001))
     const opposite = photoWide !== neighWide
     for (const side of ['right', 'left', 'down', 'up'] as Dir[]) {
-      const { w, h } = sizeAgainstEdge(photo, neighbor, side, shortSide, maxArea)
+      if (exteriorOnly && !onSilhouette(neighbor, cluster, side, gutter)) continue
+      const { w, h } = sizeAgainstEdge(photo, neighbor, side, shortSide, maxArea, shareEdge)
       for (const t of SLOT_ALIGNS) {
         const box = attachBox(neighbor, side, w, h, gutter, t)
         if (collide(box, placed, gutter)) continue
+        if (exteriorOnly && !slotExtends(box, cluster)) continue
         slots.push({ box, neighbor, side, opposite })
       }
     }
@@ -2504,94 +2533,29 @@ function photoShapedPocket(
   return touchingCount(hole, placed, gutter) >= 2
 }
 
-function corridorSlots(
-  photo: Photo,
-  placed: Placement[],
-  gutter: number,
-  shortSide: number,
-  maxArea: number,
-): BoundlessSlot[] {
-  const cluster = boundsOf(placed)
-  const pad = Math.max(shortSide * 2, 80)
-  const region: Rect = {
-    x: cluster.x - pad,
-    y: cluster.y - pad,
-    w: cluster.w + pad * 2,
-    h: cluster.h + pad * 2,
-  }
-  const natural = sizedForShort(photo, shortSide)
-  const photoWide = isWideAspect(targetCellAspect(photo))
-  const slots: BoundlessSlot[] = []
-  for (const hole of leftoverHoles(region, placed, gutter)) {
-    if (hole.w < natural.w * 0.45 || hole.h < natural.h * 0.45) continue
-    if (touchingCount(hole, placed, gutter) < 2) continue
-    const fitted = legalBox(photo, {
-      x: hole.x,
-      y: hole.y,
-      w: Math.min(hole.w, natural.w * 1.45),
-      h: Math.min(hole.h, natural.h * 1.45),
-    })
-    if (Number.isFinite(maxArea) && cellArea(fitted) > maxArea) {
-      const scale = Math.sqrt(maxArea / Math.max(cellArea(fitted), 0.001))
-      fitted.w *= scale
-      fitted.h *= scale
-    }
-    if (collide(fitted, placed, gutter)) continue
-    let neighbor = placed[0]
-    let best = Number.POSITIVE_INFINITY
-    for (const item of placed) {
-      const d =
-        Math.abs(item.x + item.w / 2 - (fitted.x + fitted.w / 2)) +
-        Math.abs(item.y + item.h / 2 - (fitted.y + fitted.h / 2))
-      if (d < best) {
-        best = d
-        neighbor = item
-      }
-    }
-    const neighWide = isWideAspect(neighbor.w / Math.max(neighbor.h, 0.001))
-    slots.push({
-      box: fitted,
-      neighbor,
-      side: 'down',
-      opposite: photoWide !== neighWide,
-    })
-  }
-  return slots
-}
-
 function scoreSlot(
   slot: BoundlessSlot,
-  photo: Photo,
   placed: Placement[],
   focusIds: Set<string>,
   hintAspect: number,
   shortSide: number,
 ): number {
   const focusPlaced = placed.filter((item) => focusIds.has(item.photoId))
-  const origin = focusPlaced.length > 0 ? centroidOf(focusPlaced) : centroidOf(placed)
-  const cx = slot.box.x + slot.box.w / 2
-  const cy = slot.box.y + slot.box.h / 2
-  const dist = Math.hypot(cx - origin.x, cy - origin.y)
-  const probe: Placement = {
-    photoId: photo.id,
-    x: slot.box.x,
-    y: slot.box.y,
-    w: slot.box.w,
-    h: slot.box.h,
-    sx: 0,
-    sy: 0,
-    sw: 1,
-    sh: 1,
+  const origin = focusPlaced.length > 0 ? centroidOf(focusPlaced) : { x: 0, y: 0 }
+  const cluster = boundsOf(placed)
+  const current = cluster.w / Math.max(cluster.h, 0.001)
+  const hint = Math.max(hintAspect, 0.001)
+  let score = slot.opposite ? 0 : shortSide * 4.5
+  if (slot.side === 'left' || slot.side === 'right') {
+    score += Math.max(0, Math.log(current / hint)) * shortSide * 2.4
+  } else {
+    score += Math.max(0, Math.log(hint / current)) * shortSide * 2.4
   }
-  const next = [...placed, probe]
-  const box = boundsOf(next)
-  const grown = box.w / Math.max(box.h, 0.001)
-  const hintPenalty = Math.abs(Math.log(grown / Math.max(hintAspect, 0.001)))
-  const recenter = Math.hypot(centroidOf(next).x - origin.x, centroidOf(next).y - origin.y)
-  let score = slot.opposite ? 0 : shortSide * 3.2
-  score += dist * 0.35
-  score += hintPenalty * shortSide * 1.8
-  score += recenter * 0.25
+  const c = centroidOf(placed)
+  if (slot.side === 'right' && c.x > origin.x + 8) score += shortSide * 0.9
+  if (slot.side === 'left' && c.x < origin.x - 8) score += shortSide * 0.9
+  if (slot.side === 'down' && c.y > origin.y + 8) score += shortSide * 0.9
+  if (slot.side === 'up' && c.y < origin.y - 8) score += shortSide * 0.9
   return score
 }
 
@@ -2603,22 +2567,23 @@ function pickSlot(
   maxArea: number,
   focusIds: Set<string>,
   hintAspect: number,
+  shareEdge: boolean,
+  exteriorOnly: boolean,
   relax: boolean,
 ): BoundlessSlot | null {
-  let slots = collectEdgeSlots(photo, placed, gutter, shortSide, maxArea)
+  let slots = collectEdgeSlots(photo, placed, gutter, shortSide, maxArea, shareEdge, exteriorOnly)
   if (!relax) {
     const opposite = slots.filter((slot) => slot.opposite)
     if (opposite.length > 0) slots = opposite
   }
-  if (slots.length === 0) slots = corridorSlots(photo, placed, gutter, shortSide, maxArea)
-  if (slots.length === 0 && relax) {
-    slots = collectEdgeSlots(photo, placed, gutter, shortSide, maxArea)
+  if (slots.length === 0 && relax && exteriorOnly) {
+    slots = collectEdgeSlots(photo, placed, gutter, shortSide, maxArea, shareEdge, true)
   }
   if (slots.length === 0) return null
   let best = slots[0]
-  let bestScore = scoreSlot(best, photo, placed, focusIds, hintAspect, shortSide)
+  let bestScore = scoreSlot(best, placed, focusIds, hintAspect, shortSide)
   for (let i = 1; i < slots.length; i++) {
-    const score = scoreSlot(slots[i], photo, placed, focusIds, hintAspect, shortSide)
+    const score = scoreSlot(slots[i], placed, focusIds, hintAspect, shortSide)
     if (score < bestScore) {
       best = slots[i]
       bestScore = score
@@ -2635,27 +2600,40 @@ function attachPhotos(
   maxArea: number,
   focusIds: Set<string>,
   hintAspect: number,
+  shareEdge: boolean,
+  exteriorOnly: boolean,
 ): Placement[] {
   let placed = seed.slice()
   const tryOne = (photo: Photo, relax: boolean): boolean => {
-    const slot = pickSlot(photo, placed, gutter, shortSide, maxArea, focusIds, hintAspect, relax)
+    const slot = pickSlot(
+      photo,
+      placed,
+      gutter,
+      shortSide,
+      maxArea,
+      focusIds,
+      hintAspect,
+      shareEdge,
+      exteriorOnly,
+      relax,
+    )
     if (!slot) return false
     placed.push(fillCell(photo, slot.box))
     return true
   }
-  let remaining = photos.filter((photo) => !tryOne(photo, false))
-  remaining = remaining.filter((photo) => !tryOne(photo, true))
+  const leftover = photos.filter((photo) => !tryOne(photo, false))
+  for (const photo of leftover) tryOne(photo, true)
   return placed
 }
 
 function packFocusKernel(focus: Photo[], gutter: number, hintAspect: number): Placement[] {
   if (focus.length === 0) return []
-  const short = PAGE_WIDTH * 0.26
+  const short = PAGE_WIDTH * 0.28
   const size = sizedForShort(focus[0], short)
   let placed = [fillCell(focus[0], { x: 0, y: 0, w: size.w, h: size.h })]
   const ids = new Set(focus.map((photo) => photo.id))
-  const cap = cellArea(placed[0]) * 1.35
-  placed = attachPhotos(focus.slice(1), placed, gutter, short, cap, ids, hintAspect)
+  const cap = cellArea(placed[0]) * 1.25
+  placed = attachPhotos(focus.slice(1), placed, gutter, short, cap, ids, hintAspect, true, false)
   const center = centroidOf(placed)
   return shiftPlacements(placed, -center.x, -center.y)
 }
@@ -2739,20 +2717,20 @@ function packBoundless(
   }
 
   const focusPlaced = placed.filter((item) => focusIds.has(item.photoId))
-  const cap = focusPlaced.length > 0 ? nicheAreaCap(focusPlaced) : Number.POSITIVE_INFINITY
   const focusShort =
     focusPlaced.length > 0
       ? Math.min(...focusPlaced.map((item) => Math.min(item.w, item.h)))
       : PAGE_WIDTH * 0.16
-  const nicheShort = Math.max(24, Math.min(focusShort / Math.sqrt(FOCUS_MIN_RATIO), Math.sqrt(Math.max(cap, 1) / LAND_ASPECT)))
+  const nicheShort = Math.max(24, focusShort * 0.5)
+  const cap = nicheShort * nicheShort * LAND_ASPECT
   const attachIds = focusIds.size > 0 ? focusIds : new Set(placed.map((item) => item.photoId))
 
-  if (!includeAll && pool.length > 4) {
-    const keep = Math.min(4, Math.max(0, Math.round(pool.length * 0.12)))
-    pool = pool.slice(0, Math.max(0, pool.length - keep))
+  if (!includeAll) {
+    const budget = Math.max(8, focus.length * 3 + 2)
+    pool = pool.slice(0, Math.min(pool.length, budget))
   }
 
-  placed = attachPhotos(pool, placed, g, nicheShort, cap, attachIds, hintAspect)
+  placed = attachPhotos(pool, placed, g, nicheShort, cap, attachIds, hintAspect, false, true)
 
   const used = new Set(placed.map((item) => item.photoId))
   let leftover = tagged.filter((photo) => !used.has(photo.id) && (focusIds.size === 0 || !focusIds.has(photo.id)))
@@ -2761,11 +2739,11 @@ function packBoundless(
   if (includeAll) {
     leftover = tagged.filter((photo) => !placed.some((item) => item.photoId === photo.id))
     if (leftover.length > 0) {
-      placed = attachPhotos(leftover, placed, g, nicheShort, cap, attachIds, hintAspect)
+      placed = attachPhotos(leftover, placed, g, nicheShort, cap, attachIds, hintAspect, false, true)
     }
     leftover = tagged.filter((photo) => !placed.some((item) => item.photoId === photo.id))
     for (const photo of leftover) {
-      const slot = pickSlot(photo, placed, g, nicheShort, cap, attachIds, hintAspect, true)
+      const slot = pickSlot(photo, placed, g, nicheShort, cap, attachIds, hintAspect, false, true, true)
       if (slot) placed.push(fillCell(photo, slot.box))
     }
   }

@@ -11,7 +11,7 @@ import {
 import { adaptSource, canPan, panSource, zoomSource } from './crop.ts'
 import { spareHoles } from './packer.ts'
 import { findCuts, nudgeCut, type Cut } from './seams.ts'
-import type { Page, Photo, Placement, Rect } from './types.ts'
+import { displayUrl, type Page, type Photo, type Placement, type Rect } from './types.ts'
 
 const SWAP_SLOP = 10
 
@@ -326,7 +326,7 @@ function CroppedPhoto({
       title={action === 'delete' ? `Delete ${photo.name}` : action === 'star' ? `Focus ${photo.name}` : photo.name}
     >
       <img
-        src={photo.objectUrl}
+        src={displayUrl(photo)}
         alt={photo.name}
         draggable={false}
         style={{
@@ -622,7 +622,7 @@ export default function PagePreview({
             )
             return (
               <img
-                src={photo.objectUrl}
+                src={displayUrl(photo)}
                 alt=""
                 draggable={false}
                 style={{
